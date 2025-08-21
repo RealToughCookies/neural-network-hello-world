@@ -84,6 +84,7 @@ def main():
     parser.add_argument('--log-csv', type=str, default='artifacts/metrics.csv', help='CSV log file for metrics')
     parser.add_argument('--plot', action='store_true', help='Generate plots after training')
     parser.add_argument('--deterministic', action='store_true', help='Enable deterministic training')
+    parser.add_argument('--confusion-matrix', action='store_true', help='Generate confusion matrix and per-class accuracy')
     
     parser.add_argument('--epochs', type=int, default=1, help='Number of training epochs')
     parser.add_argument('--batch-size', type=int, default=128, help='Batch size')
@@ -209,6 +210,21 @@ def main():
         plt.savefig("artifacts/plots/metrics.png")
         plt.close()
         print("Plot saved to artifacts/plots/metrics.png")
+
+    # Generate confusion matrix if requested
+    if args.confusion_matrix:
+        from src.metrics import (compute_confusion_matrix, per_class_accuracy,
+                                save_confusion_csv, plot_confusion_png, FASHION_LABELS)
+        
+        print("Computing confusion matrix...")
+        conf = compute_confusion_matrix(model, dl_test, device, num_classes=10)
+        save_confusion_csv(conf, "artifacts/metrics_confusion.csv", FASHION_LABELS)
+        plot_confusion_png(conf, "artifacts/plots/confusion_matrix.png", FASHION_LABELS)
+        
+        pcs = per_class_accuracy(conf)
+        print("Per-class accuracy:", [round(x, 3) for x in pcs])
+        print("Confusion matrix saved to artifacts/metrics_confusion.csv")
+        print("Confusion matrix plot saved to artifacts/plots/confusion_matrix.png")
 
 
 if __name__ == "__main__":

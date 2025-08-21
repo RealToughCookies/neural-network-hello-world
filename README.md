@@ -98,6 +98,25 @@ python -m src.train_fashion_mnist --epochs 5 --subset-train 2000 --plot
 
 CSV metrics are logged using stdlib `csv` module. Plots are generated with `matplotlib.pyplot.savefig()` for headless operation. The `--deterministic` flag enables PyTorch's deterministic algorithms for maximum reproducibility.
 
+## Confusion Matrix & Per-Class Metrics
+
+Generate confusion matrix and per-class accuracy analysis:
+
+```bash
+# Train with confusion matrix analysis
+python -m src.train_fashion_mnist --epochs 2 --subset-train 2000 --device cpu --confusion-matrix
+
+# Combined with other features
+python -m src.train_fashion_mnist --epochs 5 --subset-train 5000 --deterministic --log-csv artifacts/metrics.csv --plot --confusion-matrix
+```
+
+Outputs:
+- `artifacts/metrics_confusion.csv`: Confusion matrix with FashionMNIST class labels
+- `artifacts/plots/confusion_matrix.png`: Heatmap visualization
+- Console: Per-class accuracy breakdown
+
+Uses proper evaluation mode (`model.eval()` + `torch.no_grad()`) for accurate metrics computation.
+
 ## Run as Module
 
 All FashionMNIST commands use `python -m` to run within the package import system, which resolves the package-absolute imports correctly. This avoids ModuleNotFoundError issues when importing between src modules. Both the CLI and smoke test use the same `run_once()` pipeline for identical training/evaluation behavior.
