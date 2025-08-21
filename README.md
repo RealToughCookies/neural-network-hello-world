@@ -1,6 +1,6 @@
 # Neural Network Hello World
 
-A minimal PyTorch implementation that demonstrates a simple neural network learning the linear relationship y ≈ 3x + 2 on synthetic data. The project includes a single linear layer trained with SGD on noisy data, along with a smoke test to verify the model learns the target parameters within acceptable tolerance.
+A minimal PyTorch implementation featuring both synthetic data regression and FashionMNIST classification. Includes linear regression learning y ≈ 3x + 2 on toy data, and a TinyLinear classifier for FashionMNIST with comprehensive training/evaluation loops and smoke tests.
 
 ## Usage
 
@@ -23,3 +23,24 @@ python src/hello_nn.py --seed 0 --deterministic
 ```
 
 The deterministic mode enables PyTorch's deterministic algorithms and sets seeds for Python, NumPy, and PyTorch to ensure identical results on repeated runs.
+
+## FashionMNIST Classification
+
+The FashionMNIST dataset will auto-download to `.data/` on first run.
+
+Train TinyLinear classifier (default: CPU, subset of 2000 samples):
+```bash
+python src/train_fashion_mnist.py --epochs 1
+```
+
+Use GPU/MPS acceleration if available:
+```bash
+python src/train_fashion_mnist.py --epochs 5 --device auto
+```
+
+Run FashionMNIST smoke test:
+```bash
+python -c "import src.train_fashion_mnist as m; print(m.smoke_test())"
+```
+
+The smoke test trains for 1 epoch on 2000 samples and verifies that training reduces loss and achieves at least 60% validation accuracy.
