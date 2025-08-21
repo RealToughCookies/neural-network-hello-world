@@ -51,6 +51,22 @@ python -m src.train_fashion_mnist --epochs 1
 python -c "import src.train_fashion_mnist as t; print(t.smoke_test())"
 ```
 
+## Checkpoints
+
+Train with checkpoint saving (saves best and last models):
+```bash
+python -m src.train_fashion_mnist --epochs 2 --batch-size 128 --subset-train 2000 --seed 0 --device cpu --outdir artifacts
+```
+
+Checkpoints are saved to `{outdir}/checkpoints/` as `best.pt` and `last.pt`. Quick verify checkpoint loading:
+```bash
+python -c "
+from src.checkpoint import load_checkpoint; from src.models import TinyLinear
+model = TinyLinear(); epoch, extra = load_checkpoint('artifacts/checkpoints/best.pt', model)
+print(f'Loaded epoch {epoch}, extra: {extra}')
+"
+```
+
 ## Run as Module
 
 All FashionMNIST commands use `python -m` to run within the package import system, which resolves the package-absolute imports correctly. This avoids ModuleNotFoundError issues when importing between src modules. Both the CLI and smoke test use the same `run_once()` pipeline for identical training/evaluation behavior.
