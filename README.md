@@ -28,14 +28,14 @@ The deterministic mode enables PyTorch's deterministic algorithms and sets seeds
 
 The FashionMNIST dataset will auto-download to `.data/` on first run. Run commands use `python -m` to execute within the package system.
 
-Train TinyLinear classifier (default: CPU, subset of 2000 samples):
+Train TinyLinear classifier (default: CPU, full dataset):
 ```bash
-python -m src.train_fashion_mnist --epochs 1
+python -m src.train_fashion_mnist --epochs 1 --subset-train 2000
 ```
 
-Use GPU/MPS acceleration if available:
+Use GPU/MPS acceleration with subset training:
 ```bash
-python -m src.train_fashion_mnist --epochs 5 --device auto
+python -m src.train_fashion_mnist --epochs 5 --device auto --subset-train 5000
 ```
 
 Run FashionMNIST smoke test:
@@ -43,7 +43,7 @@ Run FashionMNIST smoke test:
 python -c "import src.train_fashion_mnist as t; print(t.smoke_test())"
 ```
 
-The smoke test trains for 1 epoch on 2000 training samples, evaluates on the full 10k test set, and includes a one-batch sanity check to verify the model can learn. It requires: sanity check passes, training reduces loss by ≥10%, and validation accuracy ≥60%. Evaluation uses `model.eval()` and `torch.no_grad()` for proper inference mode.
+The smoke test trains for 2 epochs on 2000 training samples, evaluates on the full 10k test set, and verifies that training reduces loss by ≥10% and validation accuracy ≥60%. Evaluation uses `model.eval()` and `torch.no_grad()` for proper inference mode. The deprecated `--subset` flag is mapped to `--subset-train`.
 
 **Verification commands:**
 ```bash
