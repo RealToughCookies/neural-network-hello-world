@@ -1,14 +1,27 @@
 import argparse
+import random
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
 
-def set_deterministic_seed(seed):
-    """Set deterministic random seed for reproducible results."""
+def set_deterministic_seed(seed, deterministic=False):
+    """Set deterministic random seed for reproducible results.
+    
+    Args:
+        seed: Random seed value
+        deterministic: If True, enables full deterministic mode for maximum reproducibility
+    """
+    random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    
+    if deterministic:
+        torch.use_deterministic_algorithms(True)
+        if torch.cuda.is_available():
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
 
 def generate_toy_data(n_samples, seed=0):
@@ -41,9 +54,9 @@ def train_model(x, y, epochs=200, lr=0.1):
     return w, b, final_loss
 
 
-def smoke_test():
+def smoke_test(deterministic=False):
     """Smoke test: train quickly and verify parameters are close to target."""
-    set_deterministic_seed(0)
+    set_deterministic_seed(0, deterministic=deterministic)
     x, y = generate_toy_data(256, seed=0)
     w, b, loss = train_model(x, y, epochs=200, lr=0.1)
     
@@ -61,9 +74,10 @@ def main():
     parser.add_argument('--lr', type=float, default=0.1, help='Learning rate')
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
     parser.add_argument('--n', type=int, default=256, help='Number of data samples')
+    parser.add_argument('--deterministic', action='store_true', help='Enable full deterministic mode for reproducible results')
     args = parser.parse_args()
     
-    set_deterministic_seed(args.seed)
+    set_deterministic_seed(args.seed, deterministic=args.deterministic)
     x, y = generate_toy_data(args.n, seed=args.seed)
     w, b, loss = train_model(x, y, epochs=args.epochs, lr=args.lr)
     
