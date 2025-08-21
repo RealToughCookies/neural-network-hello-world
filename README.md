@@ -84,6 +84,20 @@ python -m src.train_fashion_mnist --config artifacts/run.json --resume best
 python -m src.train_fashion_mnist --config artifacts/run.json --resume artifacts/checkpoints/last.pt
 ```
 
+## Logging & Plots
+
+Track training metrics with CSV logging and generate plots:
+
+```bash
+# Train with CSV logging and deterministic mode
+python -m src.train_fashion_mnist --epochs 5 --subset-train 2000 --deterministic --log-csv artifacts/metrics.csv
+
+# Train with plotting enabled
+python -m src.train_fashion_mnist --epochs 5 --subset-train 2000 --plot
+```
+
+CSV metrics are logged using stdlib `csv` module. Plots are generated with `matplotlib.pyplot.savefig()` for headless operation. The `--deterministic` flag enables PyTorch's deterministic algorithms for maximum reproducibility.
+
 ## Run as Module
 
 All FashionMNIST commands use `python -m` to run within the package import system, which resolves the package-absolute imports correctly. This avoids ModuleNotFoundError issues when importing between src modules. Both the CLI and smoke test use the same `run_once()` pipeline for identical training/evaluation behavior.

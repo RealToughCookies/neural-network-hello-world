@@ -11,6 +11,8 @@ from src.config import TrainConfig
 from src.data import get_fashion_mnist_dataloaders
 from src.models import TinyLinear
 from src.train_loop import train_one_epoch, evaluate
+from src.logger import CSVLogger
+from src.utils import set_all_seeds
 
 
 def set_seeds(seed):
@@ -79,6 +81,10 @@ def main():
     parser.add_argument('--save-config', type=str, help='Save effective config to JSON file')
     parser.add_argument('--resume', type=str, help='Resume from checkpoint (best/last or file path)')
     
+    parser.add_argument('--log-csv', type=str, default='artifacts/metrics.csv', help='CSV log file for metrics')
+    parser.add_argument('--plot', action='store_true', help='Generate plots after training')
+    parser.add_argument('--deterministic', action='store_true', help='Enable deterministic training')
+    
     parser.add_argument('--epochs', type=int, default=1, help='Number of training epochs')
     parser.add_argument('--batch-size', type=int, default=128, help='Batch size')
     parser.add_argument('--subset-train', type=int, default=None, help='Training subset size (None for full dataset)')
@@ -120,15 +126,17 @@ def main():
     print(f"Using device: {device}")
     
     # Set up training with checkpointing
-    random.seed(cfg.seed)
-    np.random.seed(cfg.seed)
-    torch.manual_seed(cfg.seed)
+    set_all_seeds(cfg.seed, deterministic=args.deterministic)
+    
     from src.checkpoint import save_checkpoint, load_checkpoint
     
     dl_train, dl_test = get_fashion_mnist_dataloaders(batch_size=cfg.batch_size, subset_train=cfg.subset_train, subset_test=None, seed=cfg.seed, data_dir=".data")
     model = TinyLinear().to(device)
     loss_fn = torch.nn.CrossEntropyLoss()
     opt = torch.optim.SGD(model.parameters(), lr=cfg.lr)
+    
+    # Initialize CSV logger
+    logger = CSVLogger(args.log_csv)
     
     # Track best validation accuracy
     best_acc = -1.0
@@ -157,6 +165,9 @@ def main():
         
         print(f"Epoch {epoch+1}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, val_acc={val_acc:.4f}")
         
+        # Log metrics
+        logger.append(epoch=epoch+1, train_loss=train_loss, val_loss=val_loss, val_acc=val_acc)
+        
         # Save last checkpoint
         save_checkpoint(model, opt, epoch+1, cfg.outdir, tag="last",
                        config=asdict(cfg))
@@ -166,6 +177,38 @@ def main():
             best_acc = val_acc
             save_checkpoint(model, opt, epoch+1, cfg.outdir, tag="best",
                            config=asdict(cfg))
+    
+    # Generate plots if requested
+    if args.plot:
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("matplotlib not available, skipping plots")
+            return
+        import csv
+        import os
+        
+        os.makedirs("artifacts/plots", exist_ok=True)
+        
+        epochs, tr, vl, acc = [], [], [], []
+        with open(args.log_csv, newline="") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                epochs.append(int(row["epoch"]))
+                tr.append(float(row["train_loss"]))
+                vl.append(float(row["val_loss"]))
+                acc.append(float(row["val_acc"]))
+        
+        plt.figure()
+        plt.plot(epochs, tr, label="train_loss")
+        plt.plot(epochs, vl, label="val_loss")
+        plt.plot(epochs, acc, label="val_acc")
+        plt.xlabel("epoch")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("artifacts/plots/metrics.png")
+        plt.close()
+        print("Plot saved to artifacts/plots/metrics.png")
 
 
 if __name__ == "__main__":
