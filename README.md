@@ -69,6 +69,21 @@ print(f'Loaded epoch {epoch}, extra: {extra}')
 
 **Note**: PyTorch 2.6+ sets `torch.load` default `weights_only=True` for security. We use `weights_only=False` for trusted local checkpoint files to avoid unpickling errors. See [PyTorch docs](https://pytorch.org/docs/stable/generated/torch.load.html) for details.
 
+## Config & Resume
+
+Save training config to JSON and resume from checkpoints:
+
+```bash
+# Save config while training
+python -m src.train_fashion_mnist --epochs 2 --subset-train 2000 --device cpu --outdir artifacts --save-config artifacts/run.json
+
+# Resume from best checkpoint using saved config
+python -m src.train_fashion_mnist --config artifacts/run.json --resume best
+
+# Resume from specific checkpoint file
+python -m src.train_fashion_mnist --config artifacts/run.json --resume artifacts/checkpoints/last.pt
+```
+
 ## Run as Module
 
 All FashionMNIST commands use `python -m` to run within the package import system, which resolves the package-absolute imports correctly. This avoids ModuleNotFoundError issues when importing between src modules. Both the CLI and smoke test use the same `run_once()` pipeline for identical training/evaluation behavior.

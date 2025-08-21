@@ -1,0 +1,9 @@
+{
+  "epochs": 1,
+  "batch_size": 128,
+  "subset_train": 2000,
+  "seed": 0,
+  "device": "cpu",
+  "lr": 0.1,
+  "outdir": "artifacts"
+}
