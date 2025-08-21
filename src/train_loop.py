@@ -46,23 +46,23 @@ def evaluate(model, dataloader, loss_fn, device):
         tuple: (average_loss, accuracy_float)
     """
     model.eval()
-    total_loss = 0.0
+    loss_sum = 0.0
     correct = 0
-    total = 0
+    n = 0
     
     with torch.no_grad():
-        for data, target in dataloader:
-            data, target = data.to(device), target.to(device)
+        for xb, yb in dataloader:
+            xb, yb = xb.to(device), yb.to(device)
             
-            output = model(data)
-            loss = loss_fn(output, target)
+            logits = model(xb)
+            loss = loss_fn(logits, yb)
             
-            total_loss += loss.item()
-            pred = output.argmax(dim=1, keepdim=True)
-            correct += pred.eq(target.view_as(pred)).sum().item()
-            total += target.size(0)
+            loss_sum += loss.item() * xb.size(0)
+            pred = logits.argmax(dim=1)
+            correct += (pred == yb).sum().item()
+            n += xb.size(0)
     
-    avg_loss = total_loss / len(dataloader)
-    accuracy = correct / total
+    avg_loss = loss_sum / n
+    accuracy = correct / n
     
     return avg_loss, accuracy

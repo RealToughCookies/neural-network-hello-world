@@ -32,9 +32,11 @@ def get_fashion_mnist_dataloaders(batch_size=128, subset=None, seed=0, data_dir=
     
     # Apply subset if specified
     if subset is not None:
-        generator = torch.Generator().manual_seed(seed)
-        train_indices = torch.randperm(len(train_dataset), generator=generator)[:subset]
-        test_indices = torch.randperm(len(test_dataset), generator=generator)[:min(subset, len(test_dataset))]
+        # Use separate generators for deterministic subset selection
+        train_gen = torch.Generator().manual_seed(seed)
+        test_gen = torch.Generator().manual_seed(seed)
+        train_indices = torch.randperm(len(train_dataset), generator=train_gen)[:subset]
+        test_indices = torch.randperm(len(test_dataset), generator=test_gen)[:min(subset, len(test_dataset))]
         
         train_dataset = Subset(train_dataset, train_indices)
         test_dataset = Subset(test_dataset, test_indices)

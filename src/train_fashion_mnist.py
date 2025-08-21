@@ -38,7 +38,10 @@ def smoke_test():
     Returns:
         bool: True if training reduces loss and achieves reasonable accuracy
     """
-    set_seeds(0)
+    # Set deterministic seeds for reproducibility
+    random.seed(0)
+    np.random.seed(0)
+    torch.manual_seed(0)
     device = torch.device("cpu")  # Use CPU for consistent smoke test
     
     # Get small subset for fast testing
@@ -51,16 +54,15 @@ def smoke_test():
     loss_fn = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=0.1)
     
-    # Get initial loss on first batch
-    model.eval()
-    with torch.no_grad():
-        first_batch = next(iter(train_dl))
-        data, target = first_batch[0].to(device), first_batch[1].to(device)
-        initial_loss = loss_fn(model(data), target).item()
+    # Get initial loss on entire train set
+    initial_loss, _ = evaluate(model, train_dl, loss_fn, device)
     
     # Train for 1 epoch
     final_train_loss = train_one_epoch(model, train_dl, optimizer, loss_fn, device)
     val_loss, val_acc = evaluate(model, test_dl, loss_fn, device)
+    
+    # Log results for verification
+    print(f"smoke: initial_loss={initial_loss:.4f} final_train_loss={final_train_loss:.4f} val_acc={val_acc:.4f}")
     
     # Check if training worked: loss decreased and accuracy is reasonable
     loss_decreased = final_train_loss <= 0.9 * initial_loss
