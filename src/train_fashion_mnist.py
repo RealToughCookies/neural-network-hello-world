@@ -32,43 +32,42 @@ def get_device(device_arg):
         return torch.device(device_arg)
 
 
+def run_once(*, epochs=1, batch_size=128, subset=2000, seed=0, device="cpu"):
+    """Shared training/evaluation pipeline for both CLI and smoke test."""
+    import random
+    import numpy as np
+    import torch
+    random.seed(seed)
+    np.random.seed(seed) 
+    torch.manual_seed(seed)
+    from src.data import get_fashion_mnist_dataloaders
+    from src.models import TinyLinear
+    from src.train_loop import train_one_epoch, evaluate
+    dl_train, dl_test = get_fashion_mnist_dataloaders(batch_size=batch_size, subset=subset, seed=seed, data_dir=".data")
+    model = TinyLinear().to(device)
+    loss_fn = torch.nn.CrossEntropyLoss()
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    # initial loss on train (eval/no_grad)
+    model.eval()
+    initial_loss, _ = evaluate(model, dl_train, loss_fn, device)
+    # train epochs
+    final_train_loss = None
+    for _ in range(epochs):
+        final_train_loss = train_one_epoch(model, dl_train, opt, loss_fn, device)
+    # eval on test
+    val_loss, val_acc = evaluate(model, dl_test, loss_fn, device)
+    return initial_loss, final_train_loss, val_loss, val_acc
+
+
 def smoke_test():
     """Smoke test: quick training to verify setup works correctly.
     
     Returns:
         bool: True if training reduces loss and achieves reasonable accuracy
     """
-    # Set deterministic seeds for reproducibility
-    random.seed(0)
-    np.random.seed(0)
-    torch.manual_seed(0)
-    device = torch.device("cpu")  # Use CPU for consistent smoke test
-    
-    # Get small subset for fast testing
-    train_dl, test_dl = get_fashion_mnist_dataloaders(
-        batch_size=128, subset=2000, seed=0
-    )
-    
-    # Setup model, loss, optimizer
-    model = TinyLinear().to(device)
-    loss_fn = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=0.1)
-    
-    # Get initial loss on entire train set
-    initial_loss, _ = evaluate(model, train_dl, loss_fn, device)
-    
-    # Train for 1 epoch
-    final_train_loss = train_one_epoch(model, train_dl, optimizer, loss_fn, device)
-    val_loss, val_acc = evaluate(model, test_dl, loss_fn, device)
-    
-    # Log results for verification
-    print(f"smoke: initial_loss={initial_loss:.4f} final_train_loss={final_train_loss:.4f} val_acc={val_acc:.4f}")
-    
-    # Check if training worked: loss decreased and accuracy is reasonable
-    loss_decreased = final_train_loss <= 0.9 * initial_loss
-    accuracy_ok = val_acc >= 0.60
-    
-    return loss_decreased and accuracy_ok
+    initial, final_train, val_loss, val_acc = run_once(epochs=1, batch_size=128, subset=2000, seed=0, device="cpu")
+    print(f"smoke: initial_loss={initial:.4f} final_train_loss={final_train:.4f} val_acc={val_acc:.4f}")
+    return (final_train <= 0.9 * initial) and (val_acc >= 0.60)
 
 
 def main():
@@ -81,26 +80,13 @@ def main():
                        help='Device: cpu or auto (tries MPS/CUDA if available)')
     args = parser.parse_args()
     
-    set_seeds(args.seed)
-    device = get_device(args.device)
+    device = get_device(args.device) 
     print(f"Using device: {device}")
     
-    # Get dataloaders
-    train_dl, test_dl = get_fashion_mnist_dataloaders(
-        batch_size=args.batch_size, subset=args.subset, seed=args.seed
+    initial, final_train, val_loss, val_acc = run_once(
+        epochs=args.epochs, batch_size=args.batch_size, subset=args.subset, seed=args.seed, device=str(device)
     )
-    
-    # Setup model, loss, optimizer
-    model = TinyLinear().to(device)
-    loss_fn = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=0.1)
-    
-    # Training loop
-    for epoch in range(args.epochs):
-        train_loss = train_one_epoch(model, train_dl, optimizer, loss_fn, device)
-        val_loss, val_acc = evaluate(model, test_dl, loss_fn, device)
-        
-        print(f"Epoch {epoch+1}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, val_acc={val_acc:.4f}")
+    print(f"Epoch {args.epochs}: train_loss={final_train:.4f}, val_loss={val_loss:.4f}, val_acc={val_acc:.4f}")
 
 
 if __name__ == "__main__":
