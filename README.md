@@ -26,21 +26,25 @@ The deterministic mode enables PyTorch's deterministic algorithms and sets seeds
 
 ## FashionMNIST Classification
 
-The FashionMNIST dataset will auto-download to `.data/` on first run.
+The FashionMNIST dataset will auto-download to `.data/` on first run. Run commands use `python -m` to execute within the package system.
 
 Train TinyLinear classifier (default: CPU, subset of 2000 samples):
 ```bash
-python src/train_fashion_mnist.py --epochs 1
+python -m src.train_fashion_mnist --epochs 1
 ```
 
 Use GPU/MPS acceleration if available:
 ```bash
-python src/train_fashion_mnist.py --epochs 5 --device auto
+python -m src.train_fashion_mnist --epochs 5 --device auto
 ```
 
 Run FashionMNIST smoke test:
 ```bash
-python -c "import src.train_fashion_mnist as m; print(m.smoke_test())"
+python -c "import src.train_fashion_mnist as t; print(t.smoke_test())"
 ```
 
 The smoke test trains for 1 epoch on 2000 samples and verifies that training reduces loss and achieves at least 60% validation accuracy.
+
+## Run as Module
+
+All FashionMNIST commands use `python -m` to run within the package import system, which resolves the package-absolute imports correctly. This avoids ModuleNotFoundError issues when importing between src modules.

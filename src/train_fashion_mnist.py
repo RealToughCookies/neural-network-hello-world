@@ -5,9 +5,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from data import get_fashion_mnist_dataloaders
-from models import TinyLinear
-from train_loop import train_one_epoch, evaluate
+from src.data import get_fashion_mnist_dataloaders
+from src.models import TinyLinear
+from src.train_loop import train_one_epoch, evaluate
 
 
 def set_seeds(seed):
