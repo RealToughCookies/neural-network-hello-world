@@ -43,7 +43,7 @@ def run_once(*, epochs=1, batch_size=128, subset=2000, seed=0, device="cpu"):
     from src.data import get_fashion_mnist_dataloaders
     from src.models import TinyLinear
     from src.train_loop import train_one_epoch, evaluate
-    dl_train, dl_test = get_fashion_mnist_dataloaders(batch_size=batch_size, subset=subset, seed=seed, data_dir=".data")
+    dl_train, dl_test = get_fashion_mnist_dataloaders(batch_size=batch_size, subset_train=subset, subset_test=None, seed=seed, data_dir=".data")
     model = TinyLinear().to(device)
     loss_fn = torch.nn.CrossEntropyLoss()
     opt = torch.optim.SGD(model.parameters(), lr=0.1)
@@ -59,15 +59,44 @@ def run_once(*, epochs=1, batch_size=128, subset=2000, seed=0, device="cpu"):
     return initial_loss, final_train_loss, val_loss, val_acc
 
 
+def one_batch_sanity_step(model, dl, loss_fn, device):
+    """Single batch gradient step to verify model can learn."""
+    model.train()
+    xb, yb = next(iter(dl))
+    xb, yb = xb.to(device), yb.to(device)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    with torch.no_grad():
+        before, _ = evaluate(model, [(xb, yb)], loss_fn, device)
+    opt.zero_grad()
+    logits = model(xb)
+    loss = loss_fn(logits, yb)
+    loss.backward()
+    opt.step()
+    with torch.no_grad():
+        after, _ = evaluate(model, [(xb, yb)], loss_fn, device)
+    return before > after
+
+
 def smoke_test():
     """Smoke test: quick training to verify setup works correctly.
     
     Returns:
         bool: True if training reduces loss and achieves reasonable accuracy
     """
-    initial, final_train, val_loss, val_acc = run_once(epochs=1, batch_size=128, subset=2000, seed=0, device="cpu")
-    print(f"smoke: initial_loss={initial:.4f} final_train_loss={final_train:.4f} val_acc={val_acc:.4f}")
-    return (final_train <= 0.9 * initial) and (val_acc >= 0.60)
+    initial, final_train, val_loss, val_acc = run_once(epochs=1, batch_size=128, subset_train=2000, seed=0, device="cpu")
+    
+    # Run sanity check on same train loader setup
+    import torch
+    torch.manual_seed(0)
+    from src.data import get_fashion_mnist_dataloaders
+    from src.models import TinyLinear
+    dl_train, _ = get_fashion_mnist_dataloaders(batch_size=128, subset_train=2000, subset_test=None, seed=0, data_dir=".data")
+    model = TinyLinear().to("cpu")
+    loss_fn = torch.nn.CrossEntropyLoss()
+    sanity = one_batch_sanity_step(model, dl_train, loss_fn, "cpu")
+    
+    print(f"smoke: initial={initial:.4f}, final_train={final_train:.4f}, val_acc={val_acc:.4f}, sanity={sanity}")
+    return sanity and (final_train <= 0.9 * initial) and (val_acc >= 0.60)
 
 
 def main():

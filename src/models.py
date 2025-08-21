@@ -9,7 +9,7 @@ class TinyLinear(nn.Module):
     
     def __init__(self):
         super().__init__()
-        self.flatten = nn.Flatten()
+        self.flatten = nn.Flatten(start_dim=1)
         self.linear = nn.Linear(28 * 28, 10)
     
     def forward(self, x):

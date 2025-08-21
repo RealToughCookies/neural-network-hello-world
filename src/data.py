@@ -4,12 +4,13 @@ import torchvision
 from torchvision import transforms
 
 
-def get_fashion_mnist_dataloaders(batch_size=128, subset=None, seed=0, data_dir=".data"):
+def get_fashion_mnist_dataloaders(batch_size=128, subset_train=None, subset_test=None, seed=0, data_dir=".data"):
     """Get FashionMNIST train and test dataloaders.
     
     Args:
         batch_size: Batch size for dataloaders
-        subset: If not None, use only this many samples from each split
+        subset_train: If not None, use only this many samples from train split
+        subset_test: If not None, use only this many samples from test split
         seed: Random seed for deterministic subset selection
         data_dir: Directory to store/load dataset
     
@@ -30,15 +31,16 @@ def get_fashion_mnist_dataloaders(batch_size=128, subset=None, seed=0, data_dir=
         root=data_dir, train=False, download=True, transform=transform
     )
     
-    # Apply subset if specified
-    if subset is not None:
-        # Use separate generators for deterministic subset selection
+    # Apply train subset if specified
+    if subset_train is not None:
         train_gen = torch.Generator().manual_seed(seed)
-        test_gen = torch.Generator().manual_seed(seed)
-        train_indices = torch.randperm(len(train_dataset), generator=train_gen)[:subset]
-        test_indices = torch.randperm(len(test_dataset), generator=test_gen)[:min(subset, len(test_dataset))]
-        
+        train_indices = torch.randperm(len(train_dataset), generator=train_gen)[:subset_train]
         train_dataset = Subset(train_dataset, train_indices)
+    
+    # Apply test subset if specified
+    if subset_test is not None:
+        test_gen = torch.Generator().manual_seed(seed)
+        test_indices = torch.randperm(len(test_dataset), generator=test_gen)[:min(subset_test, len(test_dataset))]
         test_dataset = Subset(test_dataset, test_indices)
     
     # Create dataloaders

@@ -43,7 +43,7 @@ Run FashionMNIST smoke test:
 python -c "import src.train_fashion_mnist as t; print(t.smoke_test())"
 ```
 
-The smoke test trains for 1 epoch on 2000 samples and verifies that training reduces loss by at least 10% and achieves at least 60% validation accuracy. Evaluation uses `model.eval()` and `torch.no_grad()` for proper inference mode.
+The smoke test trains for 1 epoch on 2000 training samples, evaluates on the full 10k test set, and includes a one-batch sanity check to verify the model can learn. It requires: sanity check passes, training reduces loss by ≥10%, and validation accuracy ≥60%. Evaluation uses `model.eval()` and `torch.no_grad()` for proper inference mode.
 
 **Verification commands:**
 ```bash
