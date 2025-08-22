@@ -215,6 +215,20 @@ python -m src.rl.ppo_selfplay_skeleton --dry-run
 
 Alternative: Use `--env pistonball` with [PettingZoo](https://pettingzoo.farama.org/) if GRF unavailable.
 
+## PPO Core
+
+Minimal Proximal Policy Optimization implementation with GAE (Generalized Advantage Estimation) and clipped policy loss:
+
+```bash
+# Run PPO smoke training
+python -m src.rl.ppo_selfplay_skeleton --train --env pistonball
+
+# Test with different rollout length
+python -m src.rl.ppo_selfplay_skeleton --train --steps 512
+```
+
+Features: clipped policy gradients, MSE value loss, entropy regularization, and KL divergence early stopping. Based on Schulman et al. 2017 (PPO) and 2015 (GAE).
+
 ## Run as Module
 
 All FashionMNIST commands use `python -m` to run within the package import system, which resolves the package-absolute imports correctly. This avoids ModuleNotFoundError issues when importing between src modules. Both the CLI and smoke test use the same `run_once()` pipeline for identical training/evaluation behavior.

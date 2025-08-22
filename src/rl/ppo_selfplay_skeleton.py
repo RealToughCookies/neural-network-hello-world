@@ -10,27 +10,38 @@ import torch
 import torch.nn as nn
 
 
-class PolicyNetwork(nn.Module):
-    """Minimal policy network for multi-discrete action spaces."""
+class PolicyNet(nn.Module):
+    """Policy network with categorical distribution."""
     
-    def __init__(self, obs_dim, action_dims):
+    def __init__(self, obs_dim, action_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(obs_dim, 256),
+            nn.Linear(obs_dim, 64),
             nn.ReLU(),
-            nn.Linear(256, 128),
+            nn.Linear(64, 64),
             nn.ReLU(),
+            nn.Linear(64, action_dim)
         )
         
-        # Multi-head outputs for different action components
-        self.action_heads = nn.ModuleList([
-            nn.Linear(128, dim) for dim in action_dims
-        ])
+    def forward(self, obs):
+        return self.net(obs)
+
+
+class ValueNet(nn.Module):
+    """Value function network."""
+    
+    def __init__(self, obs_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
         
     def forward(self, obs):
-        features = self.net(obs)
-        logits = [head(features) for head in self.action_heads]
-        return logits
+        return self.net(obs)
 
 
 class MockEnvironment:
@@ -93,18 +104,85 @@ def load_environment(env_name, seed=0):
     raise ValueError(f"Unknown environment: {env_name}")
 
 
-def compute_logprob_placeholder(logits, actions):
-    """Placeholder for PPO log probability computation."""
-    # TODO: Implement proper log probability calculation for multi-discrete actions
-    return torch.zeros(len(actions))
+def collect_rollout(env, policy, value_fn, steps=256):
+    """Collect rollout data from environment interaction."""
+    from src.rl.ppo_core import RolloutBuffer
+    
+    obs_dim = 10  # Mock environment observation dimension
+    buffer = RolloutBuffer(steps, obs_dim)
+    
+    obs = env.reset()
+    if not hasattr(obs, '__len__') or len(obs.shape) == 0:
+        obs = np.random.randn(obs_dim)  # Fallback for mock
+    
+    for step in range(steps):
+        # Get action from policy
+        obs_tensor = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+        
+        with torch.no_grad():
+            logits = policy(obs_tensor)
+            dist = torch.distributions.Categorical(logits=logits)
+            action = dist.sample()
+            logp = dist.log_prob(action)
+            
+            value = value_fn(obs_tensor)
+        
+        action_int = int(action.item())
+        
+        # Environment step
+        next_obs, reward, done, info = env.step(action_int)
+        
+        # Add to buffer
+        buffer.add(obs, action_int, logp.item(), reward, value.item(), done)
+        
+        obs = next_obs if not done else env.reset()
+        if not hasattr(obs, '__len__') or len(obs.shape) == 0:
+            obs = np.random.randn(obs_dim)
+    
+    # Compute GAE
+    with torch.no_grad():
+        last_val = value_fn(torch.tensor(obs, dtype=torch.float32).unsqueeze(0)).item()
+    
+    buffer.compute_gae(last_val)
+    return buffer.get_batch()
 
 
-def compute_gae_placeholder(rewards, values, dones, gamma=0.99, lam=0.95):
-    """Placeholder for Generalized Advantage Estimation."""
-    # TODO: Implement GAE for advantage computation
-    advantages = torch.zeros_like(rewards)
-    returns = rewards  # Simplified for skeleton
-    return advantages, returns
+def smoke_train(env, steps=1024):
+    """Minimal PPO training smoke test."""
+    from src.rl.ppo_core import ppo_update
+    
+    obs_dim = 10
+    action_dim = 4  # Mock environment action space
+    
+    # Create networks
+    policy = PolicyNet(obs_dim, action_dim)
+    value_fn = ValueNet(obs_dim)
+    
+    # Optimizer
+    params = list(policy.parameters()) + list(value_fn.parameters())
+    optimizer = torch.optim.Adam(params, lr=3e-4)
+    
+    # Collect rollout
+    print("Collecting rollout...")
+    batch = collect_rollout(env, policy, value_fn, steps)
+    
+    # Get initial entropy for comparison
+    with torch.no_grad():
+        logits = policy(batch['obs'])
+        dist = torch.distributions.Categorical(logits=logits)
+        ent_start = dist.entropy().mean().item()
+    
+    # PPO update
+    print("Running PPO update...")
+    pi_loss, vf_loss, kl, entropy = ppo_update(
+        policy, value_fn, optimizer, batch, 
+        epochs=4, minibatch_size=64
+    )
+    
+    print(f"PPO: pi={pi_loss:.3f} vf={vf_loss:.3f} kl={kl:.4f} ent={entropy:.3f}")
+    
+    # Simple success criteria
+    return kl <= 0.05 and entropy < ent_start
 
 
 def dry_run_environment(env, policy, steps=10):
@@ -143,6 +221,7 @@ def main():
     parser.add_argument('--steps', type=int, default=1000, help='Training steps')
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
     parser.add_argument('--dry-run', action='store_true', help='Test environment setup')
+    parser.add_argument('--train', action='store_true', help='Run PPO smoke training')
     args = parser.parse_args()
     
     # Set seeds
@@ -153,23 +232,19 @@ def main():
     # Load environment
     env = load_environment(args.env, args.seed)
     
-    # Create minimal policy
-    obs_dim = 100  # Placeholder, would be determined from env
-    action_dims = [8]  # Placeholder for multi-discrete actions
-    policy = PolicyNetwork(obs_dim, action_dims)
-    
     if args.dry_run:
+        policy = PolicyNet(10, 4)  # Mock dimensions
         dry_run_environment(env, policy, steps=5)
+        return
+    
+    if args.train:
+        success = smoke_train(env, args.steps)
+        print(f"Smoke train {'✓ PASSED' if success else '✗ FAILED'}")
         return
     
     print(f"Starting PPO self-play training for {args.steps} steps...")
     print("TODO: Implement full PPO training loop")
-    
-    # TODO: Implement self-play training loop
-    # - Collect rollouts from current policy
-    # - Update policy with PPO
-    # - Periodically freeze opponent policy
-    # - Log training metrics
+    print("Use --train for smoke test or --dry-run for environment test")
 
 
 if __name__ == "__main__":
