@@ -1,6 +1,7 @@
 import torch
 import argparse
 import os
+import sys
 from pathlib import Path
 from src.models import TinyLinear, TinyCNN
 from src.checkpoint import load_checkpoint
@@ -9,6 +10,15 @@ from src.data import get_fashion_mnist_dataloaders
 def build_model(name):
     """Factory function to build model by name."""
     return TinyLinear() if name == "linear" else TinyCNN()
+
+def infer_model_from_ckpt(path):
+    """Infer model type from checkpoint state_dict keys."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    sd = ckpt.get("model", {})
+    ks = list(sd.keys())
+    if any(k.startswith("net.0.") for k in ks): return "cnn"
+    if any(k.startswith("linear.") for k in ks): return "linear"
+    return None
 
 def load_model(name, ckpt_path, device="cpu"):
     """Load trained model from checkpoint."""
@@ -75,7 +85,7 @@ def sanity_check(model, onnx_path, device="cpu", batch_size=64):
 
 def main():
     parser = argparse.ArgumentParser(description='Export trained models to TorchScript and ONNX')
-    parser.add_argument('--model', choices=['linear', 'cnn'], default='cnn', help='Model architecture')
+    parser.add_argument('--model', choices=['auto', 'linear', 'cnn'], default='auto', help='Model architecture (auto-detect from checkpoint)')
     parser.add_argument('--ckpt', type=str, default='artifacts/checkpoints/best.pt', help='Checkpoint path')
     parser.add_argument('--outdir', type=str, default='artifacts/export', help='Output directory')
     args = parser.parse_args()
@@ -83,10 +93,23 @@ def main():
     # Ensure output directory exists
     Path(args.outdir).mkdir(parents=True, exist_ok=True)
     
+    # Determine model type
+    if args.model == "auto":
+        inferred = infer_model_from_ckpt(args.ckpt) or "cnn"  # fallback
+        print(f"[export] inferred model from checkpoint: {inferred}")
+        model_name = inferred
+    else:
+        expected = infer_model_from_ckpt(args.ckpt)
+        if expected is not None and expected != args.model:
+            print(f"✗ Checkpoint looks like '{expected}' but you forced '{args.model}'.")
+            print("Use --model auto or pass the matching checkpoint.")
+            sys.exit(2)
+        model_name = args.model
+    
     # Load model
-    model = load_model(args.model, args.ckpt)
+    model = load_model(model_name, args.ckpt)
     params = sum(p.numel() for p in model.parameters())
-    print(f"Loaded {args.model} model with {params:,} parameters")
+    print(f"Loaded {model_name} model with {params:,} parameters")
     
     # Export formats
     ts_path = Path(args.outdir) / "model_ts.pt"

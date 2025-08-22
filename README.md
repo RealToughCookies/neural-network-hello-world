@@ -156,10 +156,10 @@ Export trained models to TorchScript and ONNX formats:
 # Install export dependencies (one-time)
 pip install onnx onnxruntime
 
-# Export best CNN checkpoint
-python -m src.export --model cnn --ckpt artifacts/checkpoints/best.pt --outdir artifacts/export
+# Export best checkpoint (auto-detect model type)
+python -m src.export --model auto --ckpt artifacts/checkpoints/best.pt --outdir artifacts/export
 
-# Export linear model
+# Force specific model type if needed
 python -m src.export --model linear --ckpt artifacts/checkpoints/best.pt --outdir artifacts/export
 ```
 
@@ -168,7 +168,7 @@ Outputs:
 - `artifacts/export/model.onnx`: ONNX format for cross-framework inference
 - Console: ONNX Runtime sanity check comparing predictions with PyTorch
 
-TorchScript enables deployment without Python in C++ environments. ONNX provides cross-framework compatibility with ONNX Runtime for efficient CPU/GPU inference.
+Auto-detection inspects checkpoint `state_dict` keys to determine model architecture. TorchScript enables deployment without Python in C++ environments. ONNX provides cross-framework compatibility with ONNX Runtime for efficient CPU/GPU inference.
 
 ## Run as Module
 
