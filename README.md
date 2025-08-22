@@ -2,6 +2,16 @@
 
 A minimal PyTorch implementation featuring both synthetic data regression and FashionMNIST classification. Includes linear regression learning y ≈ 3x + 2 on toy data, and a TinyLinear classifier for FashionMNIST with comprehensive training/evaluation loops and smoke tests.
 
+## Quickstart
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+make train-cnn && make export && make compare
+```
+
+This trains a CNN on FashionMNIST, exports to TorchScript/ONNX, and validates both backends produce identical predictions. See `Makefile` for individual targets: `train-cnn`, `export`, `predict`, `compare`, `tune`, `clean`.
+
 ## Usage
 
 Train the model:
