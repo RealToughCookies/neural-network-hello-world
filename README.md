@@ -229,6 +229,8 @@ python -m src.rl.ppo_selfplay_skeleton --train --steps 512
 
 Features: clipped policy gradients, MSE value loss, entropy regularization, and KL divergence early stopping. Based on Schulman et al. 2017 (PPO) and 2015 (GAE).
 
+The `smoke_train()` function is fully self-contained, creating its own environment and running a complete training cycle without external dependencies.
+
 ## Run as Module
 
 All FashionMNIST commands use `python -m` to run within the package import system, which resolves the package-absolute imports correctly. This avoids ModuleNotFoundError issues when importing between src modules. Both the CLI and smoke test use the same `run_once()` pipeline for identical training/evaluation behavior.
