@@ -12,6 +12,8 @@ make train-cnn && make export && make compare
 
 This trains a CNN on FashionMNIST, exports to TorchScript/ONNX, and validates both backends produce identical predictions. See `Makefile` for individual targets: `train-cnn`, `export`, `predict`, `compare`, `tune`, `clean`.
 
+GitHub Actions runs automated smoke tests on push/PR to validate the training pipeline, model export, and inference backends.
+
 ## Usage
 
 Train the model:
