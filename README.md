@@ -148,6 +148,28 @@ Outputs:
 
 Uses `itertools.product` for grid combinations and stdlib `csv` for logging. Focuses on SGD hyperparameters: learning rate, momentum, weight decay, and batch size.
 
+## Export
+
+Export trained models to TorchScript and ONNX formats:
+
+```bash
+# Install export dependencies (one-time)
+pip install onnx onnxruntime
+
+# Export best CNN checkpoint
+python -m src.export --model cnn --ckpt artifacts/checkpoints/best.pt --outdir artifacts/export
+
+# Export linear model
+python -m src.export --model linear --ckpt artifacts/checkpoints/best.pt --outdir artifacts/export
+```
+
+Outputs:
+- `artifacts/export/model_ts.pt`: TorchScript format for C++ deployment
+- `artifacts/export/model.onnx`: ONNX format for cross-framework inference
+- Console: ONNX Runtime sanity check comparing predictions with PyTorch
+
+TorchScript enables deployment without Python in C++ environments. ONNX provides cross-framework compatibility with ONNX Runtime for efficient CPU/GPU inference.
+
 ## Run as Module
 
 All FashionMNIST commands use `python -m` to run within the package import system, which resolves the package-absolute imports correctly. This avoids ModuleNotFoundError issues when importing between src modules. Both the CLI and smoke test use the same `run_once()` pipeline for identical training/evaluation behavior.
