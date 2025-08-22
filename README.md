@@ -202,6 +202,19 @@ python -m src.predict --backend ts --image my_fashion_item.png
 
 The inference tool automatically preprocesses inputs with the same transforms used during training. Compare mode validates that both TorchScript and ONNX backends produce identical predictions.
 
+## Dota-Class Agent Roadmap
+
+Research plan for scaling reinforcement learning to complex, multi-agent strategy games inspired by OpenAI Five. See [`docs/dota-rl-plan.md`](docs/dota-rl-plan.md) for detailed technical approach and timeline.
+
+**Quick Start:**
+```bash
+# Install Google Research Football (primary environment)
+pip install gfootball
+python -m src.rl.ppo_selfplay_skeleton --dry-run
+```
+
+Alternative: Use `--env pistonball` with [PettingZoo](https://pettingzoo.farama.org/) if GRF unavailable.
+
 ## Run as Module
 
 All FashionMNIST commands use `python -m` to run within the package import system, which resolves the package-absolute imports correctly. This avoids ModuleNotFoundError issues when importing between src modules. Both the CLI and smoke test use the same `run_once()` pipeline for identical training/evaluation behavior.
