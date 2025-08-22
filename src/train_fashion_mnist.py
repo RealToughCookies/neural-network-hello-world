@@ -9,7 +9,7 @@ from dataclasses import asdict
 
 from src.config import TrainConfig
 from src.data import get_fashion_mnist_dataloaders
-from src.models import TinyLinear
+from src.models import TinyLinear, TinyCNN
 from src.train_loop import train_one_epoch, evaluate
 from src.logger import CSVLogger
 from src.utils import set_all_seeds
@@ -37,7 +37,7 @@ def get_device(device_arg):
         return torch.device(device_arg)
 
 
-def run_once(*, epochs=1, batch_size=128, subset_train=None, seed=0, device="cpu"):
+def run_once(*, epochs=1, batch_size=128, subset_train=None, seed=0, device="cpu", model_name="linear"):
     """Shared training/evaluation pipeline for both CLI and smoke test."""
     import random
     import numpy as np
@@ -46,10 +46,14 @@ def run_once(*, epochs=1, batch_size=128, subset_train=None, seed=0, device="cpu
     np.random.seed(seed) 
     torch.manual_seed(seed)
     from src.data import get_fashion_mnist_dataloaders
-    from src.models import TinyLinear
+    from src.models import TinyLinear, TinyCNN
     from src.train_loop import train_one_epoch, evaluate
     dl_train, dl_test = get_fashion_mnist_dataloaders(batch_size=batch_size, subset_train=subset_train, subset_test=None, seed=seed, data_dir=".data")
-    model = TinyLinear().to(device)
+    
+    model = TinyLinear() if model_name == "linear" else TinyCNN()
+    model = model.to(device)
+    print(f"Model: {model_name}, Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
     loss_fn = torch.nn.CrossEntropyLoss()
     opt = torch.optim.SGD(model.parameters(), lr=0.1)
     # initial loss on train (eval/no_grad)
@@ -64,15 +68,16 @@ def run_once(*, epochs=1, batch_size=128, subset_train=None, seed=0, device="cpu
     return initial_loss, final_train_loss, val_loss, val_acc, model, opt
 
 
-def smoke_test():
+def smoke_test(model_name="cnn"):
     """Smoke test: quick training to verify setup works correctly.
     
     Returns:
         bool: True if training reduces loss and achieves reasonable accuracy
     """
-    initial, final_train, val_loss, val_acc, _, _ = run_once(epochs=2, batch_size=128, subset_train=2000, seed=0, device="cpu")
-    print(f"smoke: initial_loss={initial:.4f} final_train_loss={final_train:.4f} val_acc={val_acc:.4f}")
-    return (final_train <= 0.9 * initial) and (val_acc >= 0.60)
+    epochs = 3 if model_name == "cnn" else 2
+    initial, final_train, val_loss, val_acc, _, _ = run_once(epochs=epochs, batch_size=128, subset_train=2000, seed=0, device="cpu", model_name=model_name)
+    print(f"smoke[{model_name}]: initial={initial:.4f} final_train={final_train:.4f} val_acc={val_acc:.4f}")
+    return (final_train <= 0.9 * initial) and (val_acc >= 0.70)
 
 
 def main():
@@ -89,6 +94,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=1, help='Number of training epochs')
     parser.add_argument('--batch-size', type=int, default=128, help='Batch size')
     parser.add_argument('--subset-train', type=int, default=None, help='Training subset size (None for full dataset)')
+    parser.add_argument('--model', choices=['linear', 'cnn'], default='linear', help='Model architecture')
     parser.add_argument('--subset', type=int, default=None, help='Deprecated: use --subset-train instead')
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
     parser.add_argument('--device', choices=['cpu', 'auto'], default='cpu', 
@@ -132,7 +138,9 @@ def main():
     from src.checkpoint import save_checkpoint, load_checkpoint
     
     dl_train, dl_test = get_fashion_mnist_dataloaders(batch_size=cfg.batch_size, subset_train=cfg.subset_train, subset_test=None, seed=cfg.seed, data_dir=".data")
-    model = TinyLinear().to(device)
+    model = TinyLinear() if args.model == "linear" else TinyCNN()
+    model = model.to(device)
+    print(f"Model: {args.model}, Parameters: {sum(p.numel() for p in model.parameters()):,}")
     loss_fn = torch.nn.CrossEntropyLoss()
     opt = torch.optim.SGD(model.parameters(), lr=cfg.lr)
     

@@ -45,10 +45,23 @@ python -c "import src.train_fashion_mnist as t; print(t.smoke_test())"
 
 The smoke test trains for 2 epochs on 2000 training samples, evaluates on the full 10k test set, and verifies that training reduces loss by ≥10% and validation accuracy ≥60%. Evaluation uses `model.eval()` and `torch.no_grad()` for proper inference mode. The deprecated `--subset` flag is mapped to `--subset-train`.
 
+## Model Architectures
+
+Choose between linear classifier and CNN:
+
+```bash
+# Train linear classifier (fast, ~7k params)
+python -m src.train_fashion_mnist --epochs 1 --subset-train 2000 --model linear
+
+# Train CNN (stronger, ~3M params)
+python -m src.train_fashion_mnist --epochs 2 --subset-train 2000 --model cnn
+```
+
 **Verification commands:**
 ```bash
 python -m src.train_fashion_mnist --epochs 1
-python -c "import src.train_fashion_mnist as t; print(t.smoke_test())"
+# Test CNN model (targets ≥70% accuracy)
+python -c "import src.train_fashion_mnist as t; print(t.smoke_test('cnn'))"
 ```
 
 ## Checkpoints
