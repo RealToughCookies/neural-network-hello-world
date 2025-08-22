@@ -37,7 +37,7 @@ def get_device(device_arg):
         return torch.device(device_arg)
 
 
-def run_once(*, epochs=1, batch_size=128, subset_train=None, seed=0, device="cpu", model_name="linear"):
+def run_once(*, epochs=1, batch_size=128, subset_train=None, seed=0, device="cpu", model_name="linear", lr=0.1, momentum=0.0, weight_decay=0.0):
     """Shared training/evaluation pipeline for both CLI and smoke test."""
     import random
     import numpy as np
@@ -55,7 +55,7 @@ def run_once(*, epochs=1, batch_size=128, subset_train=None, seed=0, device="cpu
     print(f"Model: {model_name}, Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     loss_fn = torch.nn.CrossEntropyLoss()
-    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
     # initial loss on train (eval/no_grad)
     model.eval()
     initial_loss, _ = evaluate(model, dl_train, loss_fn, device)

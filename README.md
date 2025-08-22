@@ -130,6 +130,24 @@ Outputs:
 
 Uses proper evaluation mode (`model.eval()` + `torch.no_grad()`) for accurate metrics computation.
 
+## Hyperparameter Tuning
+
+Run grid search for TinyCNN hyperparameters:
+
+```bash
+# Default grid search (small and fast)
+python -m src.tune
+
+# Quick smoke test
+python -c "import src.tune as t; print(t.smoke_test())"
+```
+
+Outputs:
+- `artifacts/tuning.csv`: Grid search results with hyperparameters and metrics
+- Console: Top-3 configurations sorted by validation accuracy
+
+Uses `itertools.product` for grid combinations and stdlib `csv` for logging. Focuses on SGD hyperparameters: learning rate, momentum, weight decay, and batch size.
+
 ## Run as Module
 
 All FashionMNIST commands use `python -m` to run within the package import system, which resolves the package-absolute imports correctly. This avoids ModuleNotFoundError issues when importing between src modules. Both the CLI and smoke test use the same `run_once()` pipeline for identical training/evaluation behavior.
