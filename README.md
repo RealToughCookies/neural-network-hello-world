@@ -170,6 +170,26 @@ Outputs:
 
 Auto-detection inspects checkpoint `state_dict` keys to determine model architecture. TorchScript enables deployment without Python in C++ environments. ONNX provides cross-framework compatibility with ONNX Runtime for efficient CPU/GPU inference.
 
+## Inference
+
+Run inference on exported models:
+
+```bash
+# TorchScript inference on test sample
+python -m src.predict --backend ts --sample 0
+
+# ONNX Runtime inference on test sample
+python -m src.predict --backend onnx --sample 0
+
+# Compare both backends
+python -m src.predict --compare --sample 42
+
+# Inference on custom image (28x28 grayscale recommended)
+python -m src.predict --backend ts --image my_fashion_item.png
+```
+
+The inference tool automatically preprocesses inputs with the same transforms used during training. Compare mode validates that both TorchScript and ONNX backends produce identical predictions.
+
 ## Run as Module
 
 All FashionMNIST commands use `python -m` to run within the package import system, which resolves the package-absolute imports correctly. This avoids ModuleNotFoundError issues when importing between src modules. Both the CLI and smoke test use the same `run_once()` pipeline for identical training/evaluation behavior.
