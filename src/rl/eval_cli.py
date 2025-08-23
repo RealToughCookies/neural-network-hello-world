@@ -57,7 +57,14 @@ def main():
     
     # Load checkpoint
     try:
-        ckpt = _load_rl_ckpt(str(ckpt_path), pi_good, vf_good, pi_adv, vf_adv)
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)  # trusted local file
+        
+        # Load state dicts into networks
+        pi_good.load_state_dict(ckpt["pi_good"])
+        vf_good.load_state_dict(ckpt["vf_good"])
+        pi_adv.load_state_dict(ckpt["pi_adv"])
+        vf_adv.load_state_dict(ckpt["vf_adv"])
+        
         step = ckpt.get("step", 0)
         config = ckpt.get("config", {})
         

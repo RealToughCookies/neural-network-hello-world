@@ -916,6 +916,7 @@ def main():
     parser.add_argument('--eval-eps', type=int, default=4, help='Episodes for evaluation')
     parser.add_argument('--save-dir', default='artifacts/rl_ckpts', help='Checkpoint directory')
     parser.add_argument('--resume', default='', help='Resume from checkpoint (path, "best", or "last")')
+    parser.add_argument('--updates', type=int, default=10, help='Number of PPO updates')
     args = parser.parse_args()
     
     # Set seeds
@@ -941,9 +942,162 @@ def main():
         print(f"Self-play smoke train {'✓ PASSED' if success else '✗ FAILED'}")
         return
     
-    print(f"Starting PPO self-play training for {args.steps} steps...")
-    print("TODO: Implement full PPO training loop")
-    print("Use --train for smoke test or --dry-run for environment test")
+    # Full self-play training loop with robust checkpointing
+    from src.rl.selfplay import OpponentPool, Matchmaker, evaluate
+    from src.rl.ppo_core import ppo_update
+    
+    print(f"Starting PPO self-play training: {args.updates} updates, {args.steps} steps/update")
+    
+    # Create role-specific policy and value heads
+    pi_good, vf_good = PolicyHead(10, n_act=N_ACT), ValueHead(10)  # Good agents: 10-D obs
+    pi_adv, vf_adv = PolicyHead(8, n_act=N_ACT), ValueHead(8)      # Adversary agents: 8-D obs
+    
+    # Create opponent copies
+    pi_good_opp, vf_good_opp = PolicyHead(10, n_act=N_ACT), ValueHead(10)
+    pi_adv_opp, vf_adv_opp = PolicyHead(8, n_act=N_ACT), ValueHead(8)
+    
+    # Initialize opponents as copies of learners
+    pi_good_opp.load_state_dict(pi_good.state_dict())
+    pi_adv_opp.load_state_dict(pi_adv.state_dict())
+    
+    # Single optimizer for all learner parameters
+    optimizer = torch.optim.Adam(
+        list(pi_good.parameters()) + list(vf_good.parameters()) +
+        list(pi_adv.parameters()) + list(vf_adv.parameters()), 
+        lr=3e-4
+    )
+    
+    # Initialize opponent pool and matchmaker
+    pool = OpponentPool(cap=args.pool_cap)
+    mm = Matchmaker(pool, p_latest=0.5)
+    
+    # Checkpoint and resume logic
+    start_update = 0
+    best_score = float('-inf')
+    
+    if args.resume:
+        resume_path = args.resume
+        if resume_path in ["best", "last"]:
+            resume_path = f"{args.save_dir}/{resume_path}.pt"
+        
+        resume_path_obj = _absdir(resume_path)
+        if resume_path_obj.exists():
+            try:
+                ckpt = _load_rl_ckpt(str(resume_path_obj), pi_good, vf_good, pi_adv, vf_adv, optimizer)
+                start_update = ckpt.get("step", 0)
+                
+                # Restore opponent pool
+                if "pool" in ckpt:
+                    pool._items = []
+                    for item in ckpt["pool"]:
+                        from src.rl.selfplay import OpponentSnapshot
+                        snap = OpponentSnapshot(item["pi_good"], item["pi_adv"])
+                        pool._items.append(snap)
+                
+                print(f"Resumed from checkpoint: {resume_path_obj} (update {start_update})")
+            except Exception as e:
+                print(f"Failed to load checkpoint {resume_path_obj}: {e}")
+                start_update = 0
+        else:
+            print(f"Checkpoint not found: {resume_path_obj}")
+    
+    # Training loop with robust checkpoint saving
+    _ensure_artifacts()
+    
+    for update_idx in range(start_update, start_update + args.updates):
+        print(f"\n=== Update {update_idx + 1}/{start_update + args.updates} ===")
+        
+        # Pick opponent for this episode
+        try:
+            opp_pg, opp_pa, source = mm.pick_opponent(pi_good, pi_adv)
+            
+            # Collect self-play trajectory
+            ep_rew, traj = collect_parallel_mpe(
+                env, pi_good, pi_adv, opp_pg, opp_pa, vf_good, vf_adv,
+                learner_role="good", 
+                steps=args.steps, 
+                device="cpu"
+            )
+            print(f"Collected {len(traj)} per-agent samples (opponent: {source})")
+        except Exception as e:
+            print(f"Collection failed ({e}), skipping update")
+            continue
+        
+        if not traj:
+            print("No trajectory collected, skipping update")
+            continue
+        
+        # Split trajectory by role and run PPO per role
+        batch_g = _make_batch(traj, "good")
+        batch_a = _make_batch(traj, "adv")
+        
+        # Run PPO per role
+        kl_g = kl_a = ent_g = ent_a = 0.0
+        
+        if batch_g:
+            try:
+                pi_g, vf_g, kl_g, ent_g = ppo_update(pi_good, vf_good, optimizer, batch_g,
+                                                     epochs=4, minibatch_size=64)
+                print(f"PPO good: kl={kl_g:.4f} ent={ent_g:.3f}")
+            except Exception as e:
+                print(f"PPO update failed for good agents: {e}")
+        
+        if batch_a:
+            try:
+                pi_a, vf_a, kl_a, ent_a = ppo_update(pi_adv, vf_adv, optimizer, batch_a,
+                                                     epochs=4, minibatch_size=64)
+                print(f"PPO adv: kl={kl_a:.4f} ent={ent_a:.3f}")
+            except Exception as e:
+                print(f"PPO update failed for adversary agents: {e}")
+        
+        # Update opponents and pool every swap_every updates
+        if (update_idx + 1) % args.swap_every == 0:
+            pi_good_opp.load_state_dict(pi_good.state_dict())
+            pi_adv_opp.load_state_dict(pi_adv.state_dict())
+            pool.push(pi_good, pi_adv)
+            print(f"Updated opponent pool (size: {len(pool._items)})")
+        
+        # Run evaluation every eval_every updates
+        eval_g = eval_a = 0.0
+        if (update_idx + 1) % args.eval_every == 0:
+            try:
+                eval_g, eval_a = evaluate(env, pi_good, pi_adv, episodes=args.eval_eps)
+                print(f"Eval: good={eval_g:.3f} adv={eval_a:.3f}")
+            except Exception as e:
+                print(f"Evaluation failed: {e}")
+        
+        # Always log to CSV with stable header
+        row = [int(update_idx + 1), float(kl_g), float(kl_a), 
+               float(ent_g), float(ent_a), float(eval_g), float(eval_a), str(source)]
+        _append_csv("artifacts/rl_metrics.csv", CSV_HEADER, row)
+        print(f"[csv] logged to rl_metrics.csv")
+        
+        # Save checkpoints atomically (always save regardless of training success)
+        save_dir = _absdir(args.save_dir)
+        last_path = save_dir / "last.pt"
+        best_path = save_dir / "best.pt"
+        
+        ckpt = {
+            "step": int(update_idx + 1),
+            "pi_good": pi_good.state_dict(),
+            "vf_good": vf_good.state_dict(), 
+            "pi_adv": pi_adv.state_dict(),
+            "vf_adv": vf_adv.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "pool": [{"pi_good": s.pi_good, "pi_adv": s.pi_adv} for s in getattr(pool, "_items", [])],
+            "config": vars(args),
+        }
+        _atomic_save(ckpt, last_path)
+        print(f"[ckpt] wrote {last_path}")
+        
+        # Update best checkpoint based on combined evaluation score
+        score = float(eval_g) + float(eval_a)
+        if score > best_score:
+            best_score = score
+            _atomic_save(ckpt, best_path)
+            print(f"[ckpt] updated {best_path} (score: {score:.3f})")
+    
+    print(f"\n[done] Completed {args.updates} updates")
 
 
 if __name__ == "__main__":

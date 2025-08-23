@@ -253,7 +253,7 @@ python -m src.rl.eval_cli --ckpt artifacts/rl_ckpts/best.pt --episodes 4 --env m
 
 Checkpoints include policy/value networks for both roles, optimizer state, opponent pool snapshots, and training configuration for complete resumability.
 
-Paths are resolved with `Path.resolve()`; checkpoints are written atomically. PyTorch recommends saving dicts and loading with initialized modules.
+Paths are resolved with `Path.expanduser().resolve()`; checkpoints are written atomically to `artifacts/rl_ckpts/` using temp files and `os.replace()` for corruption-proof saves. PyTorch recommends saving dicts and loading with initialized modules.
 
 ## Run as Module
 
