@@ -209,7 +209,7 @@ Research plan for scaling reinforcement learning to complex, multi-agent strateg
 **Quick Start:**
 ```bash
 # Install MPE2 (primary environment, headless)
-pip install mpe2
+pip install mpe2  # Note: On Python 3.13, fallback uses pettingzoo.mpe
 python -m src.rl.ppo_selfplay_skeleton --dry-run
 ```
 

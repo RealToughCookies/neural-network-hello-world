@@ -93,21 +93,24 @@ def load_environment(env_name, seed=0):
     
     if env_name == "mpe_adversary":
         try:
-            from mpe2 import simple_adversary_v3 as simple_adv  # preferred, headless
-        except ImportError as e:
-            raise RuntimeError("MPE2 not installed. Run: pip install mpe2") from e
+            from mpe2 import simple_adversary_v3 as simple_adv
+            backend = "mpe2"
+        except Exception:
+            from pettingzoo.mpe import simple_adversary_v3 as simple_adv
+            backend = "pettingzoo.mpe"
         
+        # Prefer parallel API
         try:
             env = simple_adv.parallel_env(max_cycles=25)
         except Exception:
-            env = simple_adv.env(max_cycles=25)  # last resort
+            env = simple_adv.env(max_cycles=25)
         
         try:
             env.reset(seed=seed)
         except Exception:
             env.reset()
         
-        print(f"Loaded MPE2 Simple Adversary environment (parallel API)")
+        print(f"[MPE backend] {backend}")
         return env
     
     if env_name == "pistonball":
