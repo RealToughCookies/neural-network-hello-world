@@ -88,7 +88,17 @@ def load_environment(env_name, seed=0):
             print(f"Loaded Google Research Football environment")
             return env
         except ImportError:
-            print("Google Research Football not available, falling back to PettingZoo")
+            print("Google Research Football not available, falling back to MPE2")
+            env_name = "mpe_adversary"
+    
+    if env_name == "mpe_adversary":
+        try:
+            from mpe2 import simple_adversary_v3
+            env = simple_adversary_v3.env(max_cycles=25)
+            print(f"Loaded MPE2 Simple Adversary environment")
+            return env
+        except ImportError:
+            print("MPE2 not available, falling back to PettingZoo")
             env_name = "pistonball"
     
     if env_name == "pistonball":
@@ -104,7 +114,7 @@ def load_environment(env_name, seed=0):
     raise ValueError(f"Unknown environment: {env_name}")
 
 
-def make_env(kind="pistonball", seed=0):
+def make_env(kind="mpe_adversary", seed=0):
     """Create environment for training (reuses load_environment logic)."""
     return load_environment(kind, seed)
 
@@ -152,7 +162,7 @@ def collect_rollout(env, policy, value_fn, steps=256):
     return buffer.get_batch()
 
 
-def smoke_train(steps=512, env_kind="pistonball", seed=0):
+def smoke_train(steps=512, env_kind="mpe_adversary", seed=0):
     """Minimal PPO training smoke test."""
     # Create environment
     env = make_env(env_kind, seed)
@@ -225,7 +235,7 @@ def dry_run_environment(env, policy, steps=10):
 
 def main():
     parser = argparse.ArgumentParser(description='PPO Self-Play Skeleton')
-    parser.add_argument('--env', choices=['grf', 'pistonball'], default='grf', help='Environment')
+    parser.add_argument('--env', choices=['grf', 'mpe_adversary', 'pistonball'], default='mpe_adversary', help='Environment')
     parser.add_argument('--steps', type=int, default=1000, help='Training steps')
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
     parser.add_argument('--dry-run', action='store_true', help='Test environment setup')

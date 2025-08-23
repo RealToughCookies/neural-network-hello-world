@@ -4,3 +4,4 @@ matplotlib
 onnx
 onnxruntime
 pillow
+mpe2

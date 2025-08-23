@@ -208,12 +208,12 @@ Research plan for scaling reinforcement learning to complex, multi-agent strateg
 
 **Quick Start:**
 ```bash
-# Install Google Research Football (primary environment)
-pip install gfootball
+# Install MPE2 (primary environment, headless)
+pip install mpe2
 python -m src.rl.ppo_selfplay_skeleton --dry-run
 ```
 
-Alternative: Use `--env pistonball` with [PettingZoo](https://pettingzoo.farama.org/) if GRF unavailable.
+Alternatives: `--env grf` (Google Research Football) or `--env pistonball` ([PettingZoo](https://pettingzoo.farama.org/)) if MPE2 unavailable.
 
 ## PPO Core
 
@@ -221,7 +221,7 @@ Minimal Proximal Policy Optimization implementation with GAE (Generalized Advant
 
 ```bash
 # Run PPO smoke training
-python -m src.rl.ppo_selfplay_skeleton --train --env pistonball
+python -m src.rl.ppo_selfplay_skeleton --train
 
 # Test with different rollout length
 python -m src.rl.ppo_selfplay_skeleton --train --steps 512
