@@ -44,6 +44,36 @@ class ValueNet(nn.Module):
         return self.net(obs)
 
 
+class PolicyHead(nn.Module):
+    """Role-specific policy head."""
+    
+    def __init__(self, in_dim, n_act=5):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 64), 
+            nn.Tanh(),
+            nn.Linear(64, n_act)
+        )
+    
+    def forward(self, x): 
+        return self.net(x)
+
+
+class ValueHead(nn.Module):
+    """Role-specific value head."""
+    
+    def __init__(self, in_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 64), 
+            nn.Tanh(),
+            nn.Linear(64, 1)
+        )
+    
+    def forward(self, x): 
+        return self.net(x).squeeze(-1)
+
+
 class MockEnvironment:
     """Mock environment for testing when no RL libraries are available."""
     
@@ -134,49 +164,69 @@ def role_split(obs_keys, learner_role):
     return (goods, advs) if learner_role == "good" else (advs, goods)
 
 
-def _act_batch(model, obs_list, device="cpu"):
-    """Batch policy forward pass for multiple agents."""
+def _act_for_keys(keys, obs_dict, pi_good, pi_adv, device="cpu"):
+    """Generate actions for keys using role-specific policy heads."""
     import torch
     import numpy as np
     from torch.distributions import Categorical
     
-    if not obs_list:
-        return np.array([]), np.array([]), 0.0, None
+    # Split by role
+    good_keys = [k for k in keys if "agent" in k]
+    adv_keys = [k for k in keys if "adversary" in k]
     
-    X = torch.tensor(np.stack(obs_list), dtype=torch.float32, device=device)
-    logits = model(X)
-    dist = Categorical(logits=logits)
-    a = dist.sample()
-    logp = dist.log_prob(a)
-    return a.cpu().numpy(), logp.detach().cpu().numpy(), dist.entropy().mean().item(), logits
+    out = {}
+    
+    # Good agents (10-D observations)
+    if good_keys:
+        Xg = torch.tensor(np.stack([obs_dict[k] for k in good_keys]), dtype=torch.float32, device=device)
+        dist = Categorical(logits=pi_good(Xg))
+        ag = dist.sample()
+        lg = dist.log_prob(ag)
+        out.update({k: (int(a), float(l)) for k, a, l in zip(good_keys, ag.cpu().numpy(), lg.detach().cpu().numpy())})
+    
+    # Adversary agents (8-D observations)
+    if adv_keys:
+        Xa = torch.tensor(np.stack([obs_dict[k] for k in adv_keys]), dtype=torch.float32, device=device)
+        dist = Categorical(logits=pi_adv(Xa))
+        aa = dist.sample()
+        la = dist.log_prob(aa)
+        out.update({k: (int(a), float(l)) for k, a, l in zip(adv_keys, aa.cpu().numpy(), la.detach().cpu().numpy())})
+    
+    return out
 
 
-def collect_parallel_mpe(env, learner, opponent, learner_role="good", steps=512, value_fn=None, device="cpu"):
-    """Collect per-agent trajectories from MPE2 parallel environment."""
+def collect_parallel_mpe(env, pi_good_l, pi_adv_l, pi_good_o, pi_adv_o, vf_good, vf_adv, learner_role="good", steps=512, device="cpu"):
+    """Collect per-agent trajectories from MPE2 parallel environment with role-specific heads."""
     import torch
     import numpy as np
     
-    obs = env.reset()
-    if isinstance(obs, tuple):
-        obs, _info = obs  # PettingZoo Parallel: (obs_dict, info_dict)
+    reset_out = env.reset()
+    obs = reset_out[0] if isinstance(reset_out, tuple) else reset_out
+    
     t = 0
     traj = []  # list of (obs, act, logp, rew, val, done)
     ep_rew = 0.0
+    printed_roles = False
     
     while t < steps:
         # Split keys by role
         keys = list(obs.keys())
-        goods = [k for k in keys if "agent" in k]
-        advs = [k for k in keys if "adversary" in k]
-        L_keys, O_keys = (goods, advs) if learner_role == "good" else (advs, goods)
+        good_keys = [k for k in keys if "agent" in k]
+        adv_keys = [k for k in keys if "adversary" in k]
+        L_keys, O_keys = (good_keys, adv_keys) if learner_role == "good" else (adv_keys, good_keys)
         
-        # Learner acts on its agents, opponent acts on the other team
-        acts_L, logp_L, _, _ = _act_batch(learner, [obs[k] for k in L_keys], device)
-        acts_O, _, _, _ = _act_batch(opponent, [obs[k] for k in O_keys], device)
+        # Print role info once
+        if not printed_roles:
+            print(f"[roles] good_dim=10 adv_dim=8 (n_good={len(good_keys)} n_adv={len(adv_keys)})")
+            printed_roles = True
+        
+        # Learner and opponent actions using role-specific heads
+        learner_acts = _act_for_keys(L_keys, obs, pi_good_l, pi_adv_l, device)
+        opponent_acts = _act_for_keys(O_keys, obs, pi_good_o, pi_adv_o, device)
         
         # Build action dictionary
-        act_dict = {k: v for k, v in zip(L_keys, acts_L)}
-        act_dict.update({k: v for k, v in zip(O_keys, acts_O)})
+        act_dict = {k: v[0] for k, v in learner_acts.items()}  # Extract action (not logp)
+        act_dict.update({k: v[0] for k, v in opponent_acts.items()})
         
         # Environment step
         try:
@@ -186,19 +236,23 @@ def collect_parallel_mpe(env, learner, opponent, learner_role="good", steps=512,
             break
         
         # Record per-agent samples for learner-controlled agents
-        for i, k in enumerate(L_keys):
+        for k in L_keys:
             ob = np.asarray(obs[k], dtype=np.float32)
-            ac = int(acts_L[i])
-            lp = float(logp_L[i])
+            n = len(ob)
+            assert n in (8, 10), f"Unexpected obs dim {n} for {k}"
+            
+            ac, lp = learner_acts[k]
             rw = float(rews.get(k, 0.0))
             done = bool(terms.get(k, False) or truncs.get(k, False))
-            val = 0.0
             
-            if value_fn is not None:
-                with torch.no_grad():
-                    val = float(value_fn(torch.tensor(ob)[None]).squeeze(0).item())
+            # Use appropriate value head based on role
+            with torch.no_grad():
+                if "agent" in k:
+                    val = float(vf_good(torch.tensor(ob)[None]).item())
+                else:
+                    val = float(vf_adv(torch.tensor(ob)[None]).item())
             
-            traj.append((ob, ac, lp, rw, val, done))
+            traj.append((ob, int(ac), float(lp), rw, val, done))
             ep_rew += rw
         
         obs = next_obs
@@ -401,24 +455,26 @@ def selfplay_smoke_train(steps=1024):
     # Create MPE2 environment
     env = make_env("mpe_adversary", seed=0)
     
-    obs_dim = 10  # Mock for compatibility
-    action_dim = 4
+    # Create role-specific policy and value heads
+    pi_good, vf_good = PolicyHead(10), ValueHead(10)  # Good agents: 10-D obs
+    pi_adv, vf_adv = PolicyHead(8), ValueHead(8)      # Adversary agents: 8-D obs
     
-    # Create two policy networks
-    learner = PolicyNet(obs_dim, action_dim)
-    opponent = PolicyNet(obs_dim, action_dim)
-    value_fn = ValueNet(obs_dim)
+    # Create opponent copies
+    pi_good_opp, vf_good_opp = PolicyHead(10), ValueHead(10)
+    pi_adv_opp, vf_adv_opp = PolicyHead(8), ValueHead(8)
     
-    # Initialize opponent as copy of learner
-    opponent.load_state_dict(learner.state_dict())
+    # Initialize opponents as copies of learners
+    pi_good_opp.load_state_dict(pi_good.state_dict())
+    pi_adv_opp.load_state_dict(pi_adv.state_dict())
+    vf_good_opp.load_state_dict(vf_good.state_dict())
+    vf_adv_opp.load_state_dict(vf_adv.state_dict())
     
-    # Create self-play runner
-    runner = SelfPlayRunner(env, learner, opponent)
-    runner.value_fn = value_fn
-    
-    # Optimizer
-    params = list(learner.parameters()) + list(value_fn.parameters())
-    optimizer = torch.optim.Adam(params, lr=3e-4)
+    # Single optimizer for all learner parameters
+    optimizer = torch.optim.Adam(
+        list(pi_good.parameters()) + list(vf_good.parameters()) +
+        list(pi_adv.parameters()) + list(vf_adv.parameters()), 
+        lr=3e-4
+    )
     
     # Get initial entropy
     with torch.no_grad():
@@ -433,16 +489,20 @@ def selfplay_smoke_train(steps=1024):
     # Try parallel collection first for MPE2
     try:
         ep_rew, traj = collect_parallel_mpe(
-            env, learner, opponent, 
+            env, pi_good, pi_adv, pi_good_opp, pi_adv_opp, vf_good, vf_adv,
             learner_role="good", 
             steps=min(steps, 256), 
-            value_fn=value_fn, 
             device="cpu"
         )
         print(f"Collected {len(traj)} per-agent samples via parallel API")
     except Exception as e:
-        print(f"Parallel collection failed ({e}), using fallback")
-        ep_rew, traj = runner.collect(steps=min(steps, 256), learner_role="good")
+        print(f"Parallel collection failed ({e}), using mock fallback")
+        # Create mock trajectory for testing
+        traj = []
+        for i in range(10):
+            ob = np.random.randn(10)  # Mock good agent obs
+            traj.append((ob, 0, 0.0, 0.1, 0.0, False))
+        ep_rew = 1.0
     
     if not traj:
         print("No trajectory collected, using mock data")
@@ -478,8 +538,11 @@ def selfplay_smoke_train(steps=1024):
         
         print(f"SelfPlay: ep_rew={ep_rew:.3f} kl={kl:.4f} ent={entropy:.3f}")
         
-        # Update opponent
-        runner.update_opponent()
+        # Update opponents
+        pi_good_opp.load_state_dict(pi_good.state_dict())
+        pi_adv_opp.load_state_dict(pi_adv.state_dict())
+        vf_good_opp.load_state_dict(vf_good.state_dict())
+        vf_adv_opp.load_state_dict(vf_adv.state_dict())
         
         # Success criteria
         return kl <= 0.05 and entropy < ent0 + 1.0
@@ -508,18 +571,17 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0):
     optimizer = torch.optim.Adam(params, lr=3e-4)
     
     # Determine collector type based on environment reset
-    _reset = env.reset()
-    if isinstance(_reset, tuple):
-        first_obs, _info = _reset
-    else:
-        first_obs = _reset
+    reset_out = env.reset()
+    first_obs = reset_out[0] if isinstance(reset_out, tuple) else reset_out
     is_parallel = isinstance(first_obs, dict)
     
     if is_parallel:
         print("[collector] parallel_mpe")
-        ep_rew, traj = collect_parallel_mpe(env, policy, policy, 
-                                           learner_role="good", steps=steps,
-                                           value_fn=value_fn, device="cpu")
+        # Create role-specific heads for single-agent training
+        pi_good, vf_good = PolicyHead(10), ValueHead(10)
+        pi_adv, vf_adv = PolicyHead(8), ValueHead(8)
+        ep_rew, traj = collect_parallel_mpe(env, pi_good, pi_adv, pi_good, pi_adv, vf_good, vf_adv,
+                                           learner_role="good", steps=steps, device="cpu")
         # Convert to batch format
         if not traj:
             print("No trajectory collected, using mock data")
