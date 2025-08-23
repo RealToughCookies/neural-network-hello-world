@@ -93,13 +93,22 @@ def load_environment(env_name, seed=0):
     
     if env_name == "mpe_adversary":
         try:
-            from mpe2 import simple_adversary_v3
-            env = simple_adversary_v3.env(max_cycles=25)
-            print(f"Loaded MPE2 Simple Adversary environment")
-            return env
-        except ImportError:
-            print("MPE2 not available, falling back to PettingZoo")
-            env_name = "pistonball"
+            from mpe2 import simple_adversary_v3 as simple_adv  # preferred, headless
+        except ImportError as e:
+            raise RuntimeError("MPE2 not installed. Run: pip install mpe2") from e
+        
+        try:
+            env = simple_adv.parallel_env(max_cycles=25)
+        except Exception:
+            env = simple_adv.env(max_cycles=25)  # last resort
+        
+        try:
+            env.reset(seed=seed)
+        except Exception:
+            env.reset()
+        
+        print(f"Loaded MPE2 Simple Adversary environment (parallel API)")
+        return env
     
     if env_name == "pistonball":
         try:
@@ -119,6 +128,82 @@ def role_split(obs_keys, learner_role):
     goods = [k for k in obs_keys if "agent" in k]
     advs = [k for k in obs_keys if "adversary" in k]
     return (goods, advs) if learner_role == "good" else (advs, goods)
+
+
+def _act_batch(model, obs_list, device="cpu"):
+    """Batch policy forward pass for multiple agents."""
+    import torch
+    import numpy as np
+    from torch.distributions import Categorical
+    
+    if not obs_list:
+        return np.array([]), np.array([]), 0.0, None
+    
+    X = torch.tensor(np.stack(obs_list), dtype=torch.float32, device=device)
+    logits = model(X)
+    dist = Categorical(logits=logits)
+    a = dist.sample()
+    logp = dist.log_prob(a)
+    return a.cpu().numpy(), logp.detach().cpu().numpy(), dist.entropy().mean().item(), logits
+
+
+def collect_parallel_mpe(env, learner, opponent, learner_role="good", steps=512, value_fn=None, device="cpu"):
+    """Collect per-agent trajectories from MPE2 parallel environment."""
+    import torch
+    import numpy as np
+    
+    obs = env.reset()
+    t = 0
+    traj = []  # list of (obs, act, logp, rew, val, done)
+    ep_rew = 0.0
+    
+    while t < steps:
+        # Split keys by role
+        keys = list(obs.keys())
+        goods = [k for k in keys if "agent" in k]
+        advs = [k for k in keys if "adversary" in k]
+        L_keys, O_keys = (goods, advs) if learner_role == "good" else (advs, goods)
+        
+        # Learner acts on its agents, opponent acts on the other team
+        acts_L, logp_L, _, _ = _act_batch(learner, [obs[k] for k in L_keys], device)
+        acts_O, _, _, _ = _act_batch(opponent, [obs[k] for k in O_keys], device)
+        
+        # Build action dictionary
+        act_dict = {k: v for k, v in zip(L_keys, acts_L)}
+        act_dict.update({k: v for k, v in zip(O_keys, acts_O)})
+        
+        # Environment step
+        try:
+            next_obs, rews, terms, truncs, _ = env.step(act_dict)
+        except Exception as e:
+            print(f"Environment step error: {e}, breaking")
+            break
+        
+        # Record per-agent samples for learner-controlled agents
+        for i, k in enumerate(L_keys):
+            ob = np.asarray(obs[k], dtype=np.float32)
+            ac = int(acts_L[i])
+            lp = float(logp_L[i])
+            rw = float(rews.get(k, 0.0))
+            done = bool(terms.get(k, False) or truncs.get(k, False))
+            val = 0.0
+            
+            if value_fn is not None:
+                with torch.no_grad():
+                    val = float(value_fn(torch.tensor(ob)[None]).squeeze(0).item())
+            
+            traj.append((ob, ac, lp, rw, val, done))
+            ep_rew += rw
+        
+        obs = next_obs
+        
+        # Check termination
+        if all(terms.values()) or all(truncs.values()):
+            break
+        
+        t += 1
+    
+    return ep_rew, traj
 
 
 def make_env(kind="mpe_adversary", seed=0):
@@ -331,9 +416,22 @@ def selfplay_smoke_train(steps=1024):
         dist = torch.distributions.Categorical(logits=logits)
         ent0 = dist.entropy().item()
     
-    # Collect self-play trajectory
+    # Collect self-play trajectory using parallel MPE2 API
     print("Collecting self-play trajectory...")
-    ep_rew, traj = runner.collect(steps=min(steps, 256), learner_role="good")
+    
+    # Try parallel collection first for MPE2
+    try:
+        ep_rew, traj = collect_parallel_mpe(
+            env, learner, opponent, 
+            learner_role="good", 
+            steps=min(steps, 256), 
+            value_fn=value_fn, 
+            device="cpu"
+        )
+        print(f"Collected {len(traj)} per-agent samples via parallel API")
+    except Exception as e:
+        print(f"Parallel collection failed ({e}), using fallback")
+        ep_rew, traj = runner.collect(steps=min(steps, 256), learner_role="good")
     
     if not traj:
         print("No trajectory collected, using mock data")
@@ -344,9 +442,9 @@ def selfplay_smoke_train(steps=1024):
     
     obs_list = [step[0] for step in traj]
     act_list = [step[1] for step in traj]
-    rew_list = [step[2] for step in traj]
-    val_list = [step[3] for step in traj]
-    logp_list = [step[5] for step in traj]
+    rew_list = [step[3] for step in traj]  # Note: different index for parallel format
+    val_list = [step[4] for step in traj]  # Note: different index for parallel format
+    logp_list = [step[2] for step in traj]  # Note: different index for parallel format
     
     # Create batch dict
     batch = {

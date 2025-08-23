@@ -223,8 +223,8 @@ Minimal Proximal Policy Optimization implementation with GAE (Generalized Advant
 # Run PPO smoke training
 python -m src.rl.ppo_selfplay_skeleton --train
 
-# Run self-play training (learner vs frozen opponent)
-python -m src.rl.ppo_selfplay_skeleton --selfplay --steps 1024
+# Run self-play training (learner vs frozen opponent) with MPE2
+python -m src.rl.ppo_selfplay_skeleton --selfplay --env mpe_adversary --steps 512
 
 # Test with different rollout length
 python -m src.rl.ppo_selfplay_skeleton --train --steps 512
