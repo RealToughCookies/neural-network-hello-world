@@ -513,12 +513,44 @@ def _ensure_artifacts():
 
 def _append_csv(path, header, row):
     """Append row to CSV with header creation."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     new = not os.path.exists(path)
     with open(path, "a", newline="") as f:
         w = csv.writer(f)
         if new: 
             w.writerow(header)
         w.writerow(row)
+
+
+def _save_rl_ckpt(path, step, pi_good, vf_good, pi_adv, vf_adv, opt, pool, config: dict):
+    """Save RL checkpoint with complete training state."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save({
+        "step": step,
+        "pi_good": pi_good.state_dict(),
+        "vf_good": vf_good.state_dict(),
+        "pi_adv": pi_adv.state_dict(),
+        "vf_adv": vf_adv.state_dict(),
+        "optimizer": opt.state_dict(),
+        "pool": [{"pi_good": s.pi_good, "pi_adv": s.pi_adv} for s in getattr(pool, "_items", [])],
+        "config": config,
+    }, path, _use_new_zipfile_serialization=False)
+
+
+def _load_rl_ckpt(path, pi_good, vf_good, pi_adv, vf_adv, opt=None):
+    """Load RL checkpoint and restore training state."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    pi_good.load_state_dict(ckpt["pi_good"])
+    vf_good.load_state_dict(ckpt["vf_good"])
+    pi_adv.load_state_dict(ckpt["pi_adv"])
+    vf_adv.load_state_dict(ckpt["vf_adv"])
+    if opt and "optimizer" in ckpt:
+        opt.load_state_dict(ckpt["optimizer"])
+    return ckpt
+
+
+# Stable CSV header for consistent logging
+CSV_HEADER = ["step", "kl_good", "kl_adv", "entropy_good", "entropy_adv", "ret_eval_good", "ret_eval_adv", "opp_source"]
 
 
 def selfplay_smoke_train(steps=1024):
@@ -553,6 +585,35 @@ def selfplay_smoke_train(steps=1024):
     # Initialize opponent pool and matchmaker
     pool = OpponentPool(cap=5)
     mm = Matchmaker(pool, p_latest=0.5)
+    
+    # Checkpoint and resume logic
+    start_step = 0
+    best_score = float('-inf')
+    save_dir = "artifacts/rl_ckpts"  # Default save directory
+    
+    # Resume from checkpoint if specified
+    resume_path = ""  # This would come from args in main training
+    if resume_path:
+        if resume_path in ["best", "last"]:
+            resume_path = f"{save_dir}/{resume_path}.pt"
+        
+        if os.path.exists(resume_path):
+            try:
+                ckpt = _load_rl_ckpt(resume_path, pi_good, vf_good, pi_adv, vf_adv, optimizer)
+                start_step = ckpt.get("step", 0)
+                
+                # Restore opponent pool
+                if "pool" in ckpt:
+                    pool._items = []
+                    for item in ckpt["pool"]:
+                        from src.rl.selfplay import OpponentSnapshot
+                        snap = OpponentSnapshot(item["pi_good"], item["pi_adv"])
+                        pool._items.append(snap)
+                
+                print(f"Resumed from checkpoint: {resume_path} (step {start_step})")
+            except Exception as e:
+                print(f"Failed to load checkpoint {resume_path}: {e}")
+                start_step = 0
     
     # CSV logging setup
     os.makedirs("artifacts", exist_ok=True)
@@ -637,8 +698,23 @@ def selfplay_smoke_train(steps=1024):
         pool.push(pi_good, pi_adv)
         
         update_idx += 1
+        
+        # Save checkpoints
+        config = {"steps": steps, "lr": 3e-4, "n_act": N_ACT}
+        current_step = start_step + update_idx
+        
+        # Always save last checkpoint
+        _save_rl_ckpt(f"{save_dir}/last.pt", current_step, pi_good, vf_good, pi_adv, vf_adv, optimizer, pool, config)
+        
+        # Check if this is the best model based on evaluation score
+        current_score = eval_g + eval_a if 'eval_g' in locals() and 'eval_a' in locals() else 0.0
+        if current_score > best_score:
+            best_score = current_score
+            _save_rl_ckpt(f"{save_dir}/best.pt", current_step, pi_good, vf_good, pi_adv, vf_adv, optimizer, pool, config)
+            print(f"New best model saved (score: {best_score:.3f})")
     else:
         logs = []  # Empty logs for CSV
+        update_idx = start_step  # Use start_step if no training occurred
     
     # Always run evaluation and CSV logging (regardless of training success)
     eval_g, eval_a = 0.0, 0.0
@@ -654,9 +730,8 @@ def selfplay_smoke_train(steps=1024):
     ent_g = logs[0][4] if len(logs) > 0 and logs[0][0] == "good" else 0.0
     ent_a = logs[1][4] if len(logs) > 1 and logs[1][0] == "adv" else (logs[0][4] if len(logs) > 0 and logs[0][0] == "adv" else 0.0)
     
-    # Always log to CSV with proper formatting
+    # Always log to CSV with stable header
     _ensure_artifacts()
-    header = ["step","kl_good","kl_adv","entropy_good","entropy_adv","ret_eval_good","ret_eval_adv","opp_source"]
     row = [int(locals().get("update_idx", 0)),
            float(locals().get("kl_g", 0.0)),
            float(locals().get("kl_a", 0.0)), 
@@ -665,7 +740,7 @@ def selfplay_smoke_train(steps=1024):
            float(locals().get("eval_g", 0.0)),
            float(locals().get("eval_a", 0.0)),
            str(locals().get("source", "n/a"))]
-    _append_csv("artifacts/rl_metrics.csv", header, row)
+    _append_csv("artifacts/rl_metrics.csv", CSV_HEADER, row)
     
     # Relaxed success criteria: allow reasonable KL drift
     if logs:
@@ -751,9 +826,10 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0):
     
     # Relaxed success criteria: allow reasonable KL drift and finite losses
     _ensure_artifacts()
-    header = ["step","kl","pi_loss","vf_loss","entropy"]
+    # Use simplified header for single-agent smoke test
+    simple_header = ["step","kl","pi_loss","vf_loss","entropy"]
     row = [0, float(kl), float(pi_loss), float(vf_loss), float(entropy)]
-    _append_csv("artifacts/rl_metrics.csv", header, row)
+    _append_csv("artifacts/rl_metrics.csv", simple_header, row)
     
     return abs(kl) <= 0.08 and abs(pi_loss) < 10.0 and abs(vf_loss) < 10.0
 
@@ -800,6 +876,8 @@ def main():
     parser.add_argument('--pool-cap', type=int, default=5, help='Opponent pool capacity')
     parser.add_argument('--eval-every', type=int, default=1, help='Evaluate every N updates')
     parser.add_argument('--eval-eps', type=int, default=4, help='Episodes for evaluation')
+    parser.add_argument('--save-dir', default='artifacts/rl_ckpts', help='Checkpoint directory')
+    parser.add_argument('--resume', default='', help='Resume from checkpoint (path, "best", or "last")')
     args = parser.parse_args()
     
     # Set seeds

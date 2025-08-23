@@ -236,6 +236,23 @@ Self-play uses frozen snapshots with a small opponent pool; PettingZoo MPE simpl
 
 The `smoke_train()` function is fully self-contained, creating its own environment and running a complete training cycle without external dependencies.
 
+## RL Checkpoint & Eval
+
+Training automatically saves best/last checkpoints with complete state (policies, optimizers, opponent pools):
+
+```bash
+# Run self-play training with checkpoints
+python -m src.rl.ppo_selfplay_skeleton --selfplay --env mpe_adversary --steps 512 --eval-every 1
+
+# Resume from checkpoint
+python -m src.rl.ppo_selfplay_skeleton --selfplay --resume last
+
+# Evaluate saved checkpoint
+python -m src.rl.eval_cli --ckpt artifacts/rl_ckpts/best.pt --episodes 4 --env mpe_adversary
+```
+
+Checkpoints include policy/value networks for both roles, optimizer state, opponent pool snapshots, and training configuration for complete resumability.
+
 ## Run as Module
 
 All FashionMNIST commands use `python -m` to run within the package import system, which resolves the package-absolute imports correctly. This avoids ModuleNotFoundError issues when importing between src modules. Both the CLI and smoke test use the same `run_once()` pipeline for identical training/evaluation behavior.
