@@ -253,6 +253,8 @@ python -m src.rl.eval_cli --ckpt artifacts/rl_ckpts/best.pt --episodes 4 --env m
 
 Checkpoints include policy/value networks for both roles, optimizer state, opponent pool snapshots, and training configuration for complete resumability.
 
+Paths are resolved with `Path.resolve()`; checkpoints are written atomically. PyTorch recommends saving dicts and loading with initialized modules.
+
 ## Run as Module
 
 All FashionMNIST commands use `python -m` to run within the package import system, which resolves the package-absolute imports correctly. This avoids ModuleNotFoundError issues when importing between src modules. Both the CLI and smoke test use the same `run_once()` pipeline for identical training/evaluation behavior.

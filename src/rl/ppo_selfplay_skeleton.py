@@ -10,8 +10,30 @@ import torch
 import torch.nn as nn
 import os
 import csv
+import tempfile
+from pathlib import Path
 
 N_ACT = 5  # Simple Adversary discrete actions: no-op, left, right, down, up
+
+
+def _absdir(p: str) -> Path:
+    """Convert string path to resolved absolute Path object."""
+    return Path(p).expanduser().resolve()
+
+
+def _atomic_save(obj, path: Path):
+    """Atomically save object to path using temp file + rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=str(path.parent), delete=False) as tmp:
+        tmp_name = tmp.name
+    try:
+        torch.save(obj, tmp_name, _use_new_zipfile_serialization=False)
+        os.replace(tmp_name, path)  # atomic on POSIX/Win
+    finally:
+        try: 
+            os.remove(tmp_name)
+        except OSError: 
+            pass
 
 
 class PolicyNet(nn.Module):
@@ -699,19 +721,33 @@ def selfplay_smoke_train(steps=1024):
         
         update_idx += 1
         
-        # Save checkpoints
+        # Save checkpoints atomically
         config = {"steps": steps, "lr": 3e-4, "n_act": N_ACT}
         current_step = start_step + update_idx
+        save_dir_path = _absdir(save_dir)
         
         # Always save last checkpoint
-        _save_rl_ckpt(f"{save_dir}/last.pt", current_step, pi_good, vf_good, pi_adv, vf_adv, optimizer, pool, config)
+        last_path = save_dir_path / "last.pt"
+        ckpt_payload = {
+            "step": current_step,
+            "pi_good": pi_good.state_dict(),
+            "vf_good": vf_good.state_dict(),
+            "pi_adv": pi_adv.state_dict(),
+            "vf_adv": vf_adv.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "pool": [{"pi_good": s.pi_good, "pi_adv": s.pi_adv} for s in getattr(pool, "_items", [])],
+            "config": config,
+        }
+        _atomic_save(ckpt_payload, last_path)
+        print(f"[ckpt] wrote {last_path}")
         
         # Check if this is the best model based on evaluation score
         current_score = eval_g + eval_a if 'eval_g' in locals() and 'eval_a' in locals() else 0.0
         if current_score > best_score:
             best_score = current_score
-            _save_rl_ckpt(f"{save_dir}/best.pt", current_step, pi_good, vf_good, pi_adv, vf_adv, optimizer, pool, config)
-            print(f"New best model saved (score: {best_score:.3f})")
+            best_path = save_dir_path / "best.pt"
+            _atomic_save(ckpt_payload, best_path)
+            print(f"[ckpt] updated {best_path} (score: {best_score:.3f})")
     else:
         logs = []  # Empty logs for CSV
         update_idx = start_step  # Use start_step if no training occurred
@@ -865,6 +901,8 @@ def dry_run_environment(env, policy, steps=10):
 
 
 def main():
+    print(f"[cwd] {os.getcwd()}")
+    
     parser = argparse.ArgumentParser(description='PPO Self-Play Skeleton')
     parser.add_argument('--env', choices=['grf', 'mpe_adversary', 'pistonball'], default='mpe_adversary', help='Environment')
     parser.add_argument('--steps', type=int, default=1000, help='Training steps')

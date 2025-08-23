@@ -7,6 +7,7 @@ import argparse
 import torch
 import sys
 import os
+from pathlib import Path
 
 # Add src to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -16,6 +17,8 @@ from src.rl.selfplay import evaluate
 
 
 def main():
+    print(f"[cwd] {os.getcwd()}")
+    
     parser = argparse.ArgumentParser(description='Evaluate RL checkpoint')
     parser.add_argument('--ckpt', required=True, help='Path to checkpoint file')
     parser.add_argument('--episodes', type=int, default=4, help='Number of evaluation episodes')
@@ -23,8 +26,20 @@ def main():
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
     args = parser.parse_args()
     
-    print(f"Evaluating checkpoint: {args.ckpt}")
+    # Resolve checkpoint path
+    ckpt_path = Path(args.ckpt).expanduser().resolve(strict=False)
+    print(f"Evaluating checkpoint: {ckpt_path}")
     print(f"Environment: {args.env}, Episodes: {args.episodes}")
+    
+    if not ckpt_path.exists():
+        parent = ckpt_path.parent
+        if parent.exists():
+            listing = ", ".join(sorted(p.name for p in parent.glob("*.pt")))
+            if not listing:
+                listing = "<no .pt files>"
+        else:
+            listing = "<missing dir>"
+        raise SystemExit(f"Checkpoint not found: {ckpt_path}\nDir contents: {listing}")
     
     # Create environment
     try:
@@ -42,11 +57,7 @@ def main():
     
     # Load checkpoint
     try:
-        if not os.path.exists(args.ckpt):
-            print(f"Checkpoint not found: {args.ckpt}")
-            return 1
-            
-        ckpt = _load_rl_ckpt(args.ckpt, pi_good, vf_good, pi_adv, vf_adv)
+        ckpt = _load_rl_ckpt(str(ckpt_path), pi_good, vf_good, pi_adv, vf_adv)
         step = ckpt.get("step", 0)
         config = ckpt.get("config", {})
         
