@@ -504,6 +504,9 @@ class SelfPlayRunner:
 
 def selfplay_smoke_train(steps=1024):
     """Minimal self-play training smoke test."""
+    from src.rl.selfplay import OpponentPool, Matchmaker, evaluate
+    import os
+    
     # Create MPE2 environment
     env = make_env("mpe_adversary", seed=0)
     
@@ -528,6 +531,19 @@ def selfplay_smoke_train(steps=1024):
         lr=3e-4
     )
     
+    # Initialize opponent pool and matchmaker
+    pool = OpponentPool(cap=5)
+    mm = Matchmaker(pool, p_latest=0.5)
+    
+    # CSV logging setup
+    os.makedirs("artifacts", exist_ok=True)
+    csv_path = "artifacts/rl_metrics.csv"
+    if not os.path.exists(csv_path):
+        with open(csv_path, 'w') as f:
+            f.write("update,mean_good,mean_adv,source\n")
+    
+    update_idx = 0
+    
     # Get initial entropy
     with torch.no_grad():
         test_obs = torch.randn(1, obs_dim)
@@ -540,13 +556,16 @@ def selfplay_smoke_train(steps=1024):
     
     # Try parallel collection first for MPE2
     try:
+        # Pick opponent for this episode
+        opp_pg, opp_pa, source = mm.pick_opponent(pi_good, pi_adv)
+        
         ep_rew, traj = collect_parallel_mpe(
-            env, pi_good, pi_adv, pi_good_opp, pi_adv_opp, vf_good, vf_adv,
+            env, pi_good, pi_adv, opp_pg, opp_pa, vf_good, vf_adv,
             learner_role="good", 
             steps=min(steps, 256), 
             device="cpu"
         )
-        print(f"Collected {len(traj)} per-agent samples via parallel API")
+        print(f"Collected {len(traj)} per-agent samples via parallel API (opponent: {source})")
     except Exception as e:
         print(f"Parallel collection failed ({e}), using mock fallback")
         # Create mock trajectory for testing
@@ -594,6 +613,23 @@ def selfplay_smoke_train(steps=1024):
         pi_adv_opp.load_state_dict(pi_adv.state_dict())
         vf_good_opp.load_state_dict(vf_good.state_dict())
         vf_adv_opp.load_state_dict(vf_adv.state_dict())
+        
+        # Update opponent pool
+        pool.push(pi_good, pi_adv)
+        
+        # Periodic evaluation
+        if (update_idx + 1) % 5 == 0:  # eval_every=5
+            try:
+                m_good, m_adv = evaluate(env, pi_good, pi_adv, episodes=4)
+                print(f"Eval: mean_return_good={m_good:.3f} mean_return_adv={m_adv:.3f}")
+                
+                # Log to CSV
+                with open(csv_path, 'a') as f:
+                    f.write(f"{update_idx},{m_good:.3f},{m_adv:.3f},{source}\n")
+            except Exception as eval_e:
+                print(f"Evaluation failed: {eval_e}")
+        
+        update_idx += 1
         
         # Success criteria: all KL <= 0.05
         return all(kl <= 0.05 for _,_,_,kl,_ in logs)
@@ -714,6 +750,9 @@ def main():
     parser.add_argument('--train', action='store_true', help='Run PPO smoke training')
     parser.add_argument('--selfplay', action='store_true', help='Run self-play training')
     parser.add_argument('--swap-every', type=int, default=1, help='Update opponent every N episodes')
+    parser.add_argument('--pool-cap', type=int, default=5, help='Opponent pool capacity')
+    parser.add_argument('--eval-every', type=int, default=5, help='Evaluate every N updates')
+    parser.add_argument('--eval-eps', type=int, default=4, help='Episodes for evaluation')
     args = parser.parse_args()
     
     # Set seeds

@@ -232,6 +232,8 @@ python -m src.rl.ppo_selfplay_skeleton --train --steps 512
 
 Features: clipped policy gradients, MSE value loss, entropy regularization, and KL divergence early stopping. Based on Schulman et al. 2017 (PPO) and 2015 (GAE).
 
+Self-play uses frozen snapshots with a small opponent pool; PettingZoo MPE simple_adversary_v3 runs via Parallel API. MPE spec: obs (8)/(10), discrete(5).
+
 The `smoke_train()` function is fully self-contained, creating its own environment and running a complete training cycle without external dependencies.
 
 ## Run as Module
