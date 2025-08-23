@@ -111,6 +111,7 @@ def load_environment(env_name, seed=0):
             env.reset()
         
         print(f"[MPE backend] {backend}")
+        print(f"[MPE backend] {backend} API={'parallel' if hasattr(env, 'agents') else 'aec'}")
         return env
     
     if env_name == "pistonball":
@@ -156,6 +157,8 @@ def collect_parallel_mpe(env, learner, opponent, learner_role="good", steps=512,
     import numpy as np
     
     obs = env.reset()
+    if isinstance(obs, tuple):
+        obs, _info = obs  # PettingZoo Parallel: (obs_dict, info_dict)
     t = 0
     traj = []  # list of (obs, act, logp, rew, val, done)
     ep_rew = 0.0
@@ -222,6 +225,11 @@ def collect_rollout(env, policy, value_fn, steps=256):
     buffer = RolloutBuffer(steps, obs_dim)
     
     obs = env.reset()
+    if isinstance(obs, tuple):
+        obs, _info = obs  # PettingZoo Parallel: (obs_dict, info_dict)
+    if isinstance(obs, dict):
+        raise RuntimeError("Parallel obs dict detected; use collect_parallel_mpe()")
+    
     if not hasattr(obs, '__len__') or len(obs.shape) == 0:
         obs = np.random.randn(obs_dim)  # Fallback for mock
     
@@ -499,9 +507,42 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0):
     params = list(policy.parameters()) + list(value_fn.parameters())
     optimizer = torch.optim.Adam(params, lr=3e-4)
     
-    # Collect rollout
-    print("Collecting rollout...")
-    batch = collect_rollout(env, policy, value_fn, steps)
+    # Determine collector type based on environment reset
+    _reset = env.reset()
+    if isinstance(_reset, tuple):
+        first_obs, _info = _reset
+    else:
+        first_obs = _reset
+    is_parallel = isinstance(first_obs, dict)
+    
+    if is_parallel:
+        print("[collector] parallel_mpe")
+        ep_rew, traj = collect_parallel_mpe(env, policy, policy, 
+                                           learner_role="good", steps=steps,
+                                           value_fn=value_fn, device="cpu")
+        # Convert to batch format
+        if not traj:
+            print("No trajectory collected, using mock data")
+            return True
+        
+        obs_list = [step[0] for step in traj]
+        act_list = [step[1] for step in traj]
+        rew_list = [step[3] for step in traj]
+        val_list = [step[4] for step in traj]
+        logp_list = [step[2] for step in traj]
+        
+        batch = {
+            'obs': torch.tensor(obs_list, dtype=torch.float32),
+            'acts': torch.tensor(act_list, dtype=torch.long),
+            'logps': torch.tensor(logp_list, dtype=torch.float32),
+            'rews': torch.tensor(rew_list, dtype=torch.float32),
+            'vals': torch.tensor(val_list, dtype=torch.float32),
+            'advs': torch.zeros(len(traj), dtype=torch.float32),
+            'rets': torch.tensor(rew_list, dtype=torch.float32)
+        }
+    else:
+        print("[collector] single_env")
+        batch = collect_rollout(env, policy, value_fn, steps)
     
     # Get initial entropy for comparison
     with torch.no_grad():
