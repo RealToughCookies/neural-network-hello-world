@@ -9,6 +9,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+N_ACT = 5  # Simple Adversary discrete actions: no-op, left, right, down, up
+
 
 class PolicyNet(nn.Module):
     """Policy network with categorical distribution."""
@@ -157,6 +159,28 @@ def load_environment(env_name, seed=0):
     raise ValueError(f"Unknown environment: {env_name}")
 
 
+def _infer_n_act(env, agent_key, default=N_ACT):
+    """Infer action space size from environment."""
+    try:
+        sp = env.action_space(agent_key)
+        import gymnasium as gym
+        if hasattr(sp, 'n'): return int(sp.n)
+        if isinstance(sp, gym.spaces.Box) and sp.shape:
+            return int(sp.shape[0])
+    except Exception:
+        pass
+    return default
+
+
+def _dist_and_sample(logits):
+    """Create distribution and sample once."""
+    from torch.distributions import Categorical
+    dist = Categorical(logits=logits)
+    a = dist.sample()
+    logp = dist.log_prob(a)
+    return dist, a, logp
+
+
 def role_split(obs_keys, learner_role):
     """Split MPE2 observation keys into learner and opponent groups."""
     goods = [k for k in obs_keys if "agent" in k]
@@ -168,7 +192,6 @@ def _act_for_keys(keys, obs_dict, pi_good, pi_adv, device="cpu"):
     """Generate actions for keys using role-specific policy heads."""
     import torch
     import numpy as np
-    from torch.distributions import Categorical
     
     # Split by role
     good_keys = [k for k in keys if "agent" in k]
@@ -178,19 +201,19 @@ def _act_for_keys(keys, obs_dict, pi_good, pi_adv, device="cpu"):
     
     # Good agents (10-D observations)
     if good_keys:
-        Xg = torch.tensor(np.stack([obs_dict[k] for k in good_keys]), dtype=torch.float32, device=device)
-        dist = Categorical(logits=pi_good(Xg))
-        ag = dist.sample()
-        lg = dist.log_prob(ag)
-        out.update({k: (int(a), float(l)) for k, a, l in zip(good_keys, ag.cpu().numpy(), lg.detach().cpu().numpy())})
+        Xg = torch.tensor(np.stack([obs_dict[k] for k in good_keys], axis=0),
+                         dtype=torch.float32, device=device)
+        dist_g, a_g, logp_g = _dist_and_sample(pi_good(Xg))
+        out.update({k: (int(a), float(lp)) for k, a, lp
+                   in zip(good_keys, a_g.cpu().numpy(), logp_g.detach().cpu().numpy())})
     
     # Adversary agents (8-D observations)
     if adv_keys:
-        Xa = torch.tensor(np.stack([obs_dict[k] for k in adv_keys]), dtype=torch.float32, device=device)
-        dist = Categorical(logits=pi_adv(Xa))
-        aa = dist.sample()
-        la = dist.log_prob(aa)
-        out.update({k: (int(a), float(l)) for k, a, l in zip(adv_keys, aa.cpu().numpy(), la.detach().cpu().numpy())})
+        Xa = torch.tensor(np.stack([obs_dict[k] for k in adv_keys], axis=0),
+                         dtype=torch.float32, device=device)
+        dist_a, a_a, logp_a = _dist_and_sample(pi_adv(Xa))
+        out.update({k: (int(a), float(lp)) for k, a, lp
+                   in zip(adv_keys, a_a.cpu().numpy(), logp_a.detach().cpu().numpy())})
     
     return out
 
@@ -456,12 +479,12 @@ def selfplay_smoke_train(steps=1024):
     env = make_env("mpe_adversary", seed=0)
     
     # Create role-specific policy and value heads
-    pi_good, vf_good = PolicyHead(10), ValueHead(10)  # Good agents: 10-D obs
-    pi_adv, vf_adv = PolicyHead(8), ValueHead(8)      # Adversary agents: 8-D obs
+    pi_good, vf_good = PolicyHead(10, n_act=N_ACT), ValueHead(10)  # Good agents: 10-D obs
+    pi_adv, vf_adv = PolicyHead(8, n_act=N_ACT), ValueHead(8)      # Adversary agents: 8-D obs
     
     # Create opponent copies
-    pi_good_opp, vf_good_opp = PolicyHead(10), ValueHead(10)
-    pi_adv_opp, vf_adv_opp = PolicyHead(8), ValueHead(8)
+    pi_good_opp, vf_good_opp = PolicyHead(10, n_act=N_ACT), ValueHead(10)
+    pi_adv_opp, vf_adv_opp = PolicyHead(8, n_act=N_ACT), ValueHead(8)
     
     # Initialize opponents as copies of learners
     pi_good_opp.load_state_dict(pi_good.state_dict())
@@ -519,13 +542,13 @@ def selfplay_smoke_train(steps=1024):
     
     # Create batch dict
     batch = {
-        'obs': torch.tensor(obs_list, dtype=torch.float32),
-        'acts': torch.tensor(act_list, dtype=torch.long),
-        'logps': torch.tensor(logp_list, dtype=torch.float32),
-        'rews': torch.tensor(rew_list, dtype=torch.float32),
-        'vals': torch.tensor(val_list, dtype=torch.float32),
+        'obs': torch.tensor(np.stack(obs_list, axis=0), dtype=torch.float32),
+        'acts': torch.tensor(np.array(act_list), dtype=torch.long),
+        'logps': torch.tensor(np.array(logp_list), dtype=torch.float32),
+        'rews': torch.tensor(np.array(rew_list), dtype=torch.float32),
+        'vals': torch.tensor(np.array(val_list), dtype=torch.float32),
         'advs': torch.zeros(len(traj), dtype=torch.float32),  # Simplified
-        'rets': torch.tensor(rew_list, dtype=torch.float32)   # Simplified
+        'rets': torch.tensor(np.array(rew_list), dtype=torch.float32)   # Simplified
     }
     
     # PPO update
@@ -578,8 +601,8 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0):
     if is_parallel:
         print("[collector] parallel_mpe")
         # Create role-specific heads for single-agent training
-        pi_good, vf_good = PolicyHead(10), ValueHead(10)
-        pi_adv, vf_adv = PolicyHead(8), ValueHead(8)
+        pi_good, vf_good = PolicyHead(10, n_act=N_ACT), ValueHead(10)
+        pi_adv, vf_adv = PolicyHead(8, n_act=N_ACT), ValueHead(8)
         ep_rew, traj = collect_parallel_mpe(env, pi_good, pi_adv, pi_good, pi_adv, vf_good, vf_adv,
                                            learner_role="good", steps=steps, device="cpu")
         # Convert to batch format
@@ -594,13 +617,13 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0):
         logp_list = [step[2] for step in traj]
         
         batch = {
-            'obs': torch.tensor(obs_list, dtype=torch.float32),
-            'acts': torch.tensor(act_list, dtype=torch.long),
-            'logps': torch.tensor(logp_list, dtype=torch.float32),
-            'rews': torch.tensor(rew_list, dtype=torch.float32),
-            'vals': torch.tensor(val_list, dtype=torch.float32),
+            'obs': torch.tensor(np.stack(obs_list, axis=0), dtype=torch.float32),
+            'acts': torch.tensor(np.array(act_list), dtype=torch.long),
+            'logps': torch.tensor(np.array(logp_list), dtype=torch.float32),
+            'rews': torch.tensor(np.array(rew_list), dtype=torch.float32),
+            'vals': torch.tensor(np.array(val_list), dtype=torch.float32),
             'advs': torch.zeros(len(traj), dtype=torch.float32),
-            'rets': torch.tensor(rew_list, dtype=torch.float32)
+            'rets': torch.tensor(np.array(rew_list), dtype=torch.float32)
         }
     else:
         print("[collector] single_env")
