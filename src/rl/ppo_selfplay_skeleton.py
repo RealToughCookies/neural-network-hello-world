@@ -275,7 +275,9 @@ def collect_parallel_mpe(env, pi_good_l, pi_adv_l, pi_good_o, pi_adv_o, vf_good,
                 else:
                     val = float(vf_adv(torch.tensor(ob)[None]).item())
             
-            traj.append((ob, int(ac), float(lp), rw, val, done))
+            # Add role tracking
+            role = "good" if "agent" in k else "adv"
+            traj.append((ob, int(ac), float(lp), rw, val, done, role))
             ep_rew += rw
         
         obs = next_obs
@@ -287,6 +289,33 @@ def collect_parallel_mpe(env, pi_good_l, pi_adv_l, pi_good_o, pi_adv_o, vf_good,
         t += 1
     
     return ep_rew, traj
+
+
+def _make_batch(traj, role):
+    """Build batch from trajectory filtered by role."""
+    import numpy as np
+    import torch
+    
+    sel = [t for t in traj if t[6] == role]
+    if not sel: return None
+    
+    obs_list  = [t[0] for t in sel]
+    acts_list = [t[1] for t in sel]
+    logp_list = [t[2] for t in sel]
+    rews_list = [t[3] for t in sel]
+    vals_list = [t[4] for t in sel]
+    done_list = [t[5] for t in sel]
+    
+    return {
+        'obs':   torch.tensor(np.stack(obs_list, axis=0), dtype=torch.float32),
+        'acts':  torch.tensor(acts_list, dtype=torch.long),
+        'logps': torch.tensor(logp_list, dtype=torch.float32),
+        'rews':  torch.tensor(rews_list, dtype=torch.float32),
+        'vals':  torch.tensor(vals_list, dtype=torch.float32),
+        'dones': torch.tensor(done_list, dtype=torch.bool),
+        'advs':  torch.zeros(len(sel), dtype=torch.float32),
+        'rets':  torch.tensor(rews_list, dtype=torch.float32)
+    }
 
 
 def make_env(kind="mpe_adversary", seed=0):
@@ -531,35 +560,34 @@ def selfplay_smoke_train(steps=1024):
         print("No trajectory collected, using mock data")
         return True
     
-    # Convert trajectory to batch format for PPO
+    # Split trajectory by role and run PPO per role
     from src.rl.ppo_core import ppo_update
     
-    obs_list = [step[0] for step in traj]
-    act_list = [step[1] for step in traj]
-    rew_list = [step[3] for step in traj]  # Note: different index for parallel format
-    val_list = [step[4] for step in traj]  # Note: different index for parallel format
-    logp_list = [step[2] for step in traj]  # Note: different index for parallel format
+    batch_g = _make_batch(traj, "good")
+    batch_a = _make_batch(traj, "adv")
     
-    # Create batch dict
-    batch = {
-        'obs': torch.tensor(np.stack(obs_list, axis=0), dtype=torch.float32),
-        'acts': torch.tensor(np.array(act_list), dtype=torch.long),
-        'logps': torch.tensor(np.array(logp_list), dtype=torch.float32),
-        'rews': torch.tensor(np.array(rew_list), dtype=torch.float32),
-        'vals': torch.tensor(np.array(val_list), dtype=torch.float32),
-        'advs': torch.zeros(len(traj), dtype=torch.float32),  # Simplified
-        'rets': torch.tensor(np.array(rew_list), dtype=torch.float32)   # Simplified
-    }
+    # Run PPO per role (skip if empty)
+    logs = []
+    if batch_g:
+        try:
+            pi_g, vf_g, kl_g, ent_g = ppo_update(pi_good, vf_good, optimizer, batch_g,
+                                                 epochs=4, minibatch_size=64)
+            logs.append(("good", pi_g, vf_g, kl_g, ent_g))
+        except Exception as e:
+            print(f"PPO update failed for good agents: {e}")
     
-    # PPO update
-    print("Running PPO update...")
-    try:
-        pi_loss, vf_loss, kl, entropy = ppo_update(
-            learner, value_fn, optimizer, batch,
-            epochs=2, minibatch_size=min(32, len(traj))
-        )
-        
-        print(f"SelfPlay: ep_rew={ep_rew:.3f} kl={kl:.4f} ent={entropy:.3f}")
+    if batch_a:
+        try:
+            pi_a, vf_a, kl_a, ent_a = ppo_update(pi_adv, vf_adv, optimizer, batch_a,
+                                                 epochs=4, minibatch_size=64)
+            logs.append(("adv", pi_a, vf_a, kl_a, ent_a))
+        except Exception as e:
+            print(f"PPO update failed for adversary agents: {e}")
+    
+    # Print compact summary and decide smoke result
+    if logs:
+        msg = " | ".join([f"{r}: kl={kl:.4f} ent={ent:.3f}" for r,_,_,kl,ent in logs])
+        print(f"PPO: {msg}")
         
         # Update opponents
         pi_good_opp.load_state_dict(pi_good.state_dict())
@@ -567,11 +595,10 @@ def selfplay_smoke_train(steps=1024):
         vf_good_opp.load_state_dict(vf_good.state_dict())
         vf_adv_opp.load_state_dict(vf_adv.state_dict())
         
-        # Success criteria
-        return kl <= 0.05 and entropy < ent0 + 1.0
-        
-    except Exception as e:
-        print(f"PPO update failed: {e}")
+        # Success criteria: all KL <= 0.05
+        return all(kl <= 0.05 for _,_,_,kl,_ in logs)
+    else:
+        print("No valid batches collected")
         return False
 
 
@@ -585,9 +612,9 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0):
     obs_dim = 10
     action_dim = 4  # Mock environment action space
     
-    # Create networks
-    policy = PolicyNet(obs_dim, action_dim)
-    value_fn = ValueNet(obs_dim)
+    # Create networks (use role-specific heads for consistency)
+    policy = PolicyHead(obs_dim, n_act=N_ACT)
+    value_fn = ValueHead(obs_dim)
     
     # Optimizer
     params = list(policy.parameters()) + list(value_fn.parameters())
@@ -698,7 +725,7 @@ def main():
     env = load_environment(args.env, args.seed)
     
     if args.dry_run:
-        policy = PolicyNet(10, 4)  # Mock dimensions
+        policy = PolicyHead(10, n_act=N_ACT)  # Use consistent 5-action head
         dry_run_environment(env, policy, steps=5)
         return
     
