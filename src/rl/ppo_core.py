@@ -107,7 +107,7 @@ def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
 
 
 def ppo_update(policy, value_fn, optimizer, batch, clip=0.2, vf_coef=0.5, ent_coef=0.01, 
-               epochs=4, minibatch_size=64, target_kl=0.02):
+               epochs=4, minibatch_size=64, target_kl=0.03):
     """PPO update with clipped policy loss and value function loss."""
     
     obs, acts, logps_old, advs, rets, vals_old = (
