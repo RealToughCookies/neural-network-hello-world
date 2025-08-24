@@ -865,6 +865,12 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0):
     last_path = save_dir / "last.pt"
     best_path = save_dir / "best.pt"
     
+    # Helper for validation
+    def _first_layer_in_dim(sd):
+        for k, v in sd.items():
+            if k.endswith("net.0.weight"): return int(v.shape[1])
+        return None
+    
     ckpt = {
         "step": 1,
         "pi_good": policy.state_dict(),
@@ -876,6 +882,13 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0):
         "config": {"steps": steps, "env": env_kind, "seed": seed},
         "meta": {"good_in": 10, "adv_in": 8, "n_act": 5},  # MPE simple_adversary spec
     }
+    
+    # Optional: assert shapes before save
+    def _assert_in_dims(sd, want):
+        got = _first_layer_in_dim(sd)
+        assert got == want, f"unexpected in_dim {got}, expected {want}"
+    _assert_in_dims(policy.state_dict(), 10)  # smoke test uses same policy
+    
     _atomic_save(ckpt, last_path)
     print(f"[ckpt] wrote {last_path}")
     _atomic_save(ckpt, best_path)
@@ -1098,6 +1111,12 @@ def main():
         last_path = save_dir / "last.pt"
         best_path = save_dir / "best.pt"
         
+        # Helper for validation
+        def _first_layer_in_dim(sd):
+            for k, v in sd.items():
+                if k.endswith("net.0.weight"): return int(v.shape[1])
+            return None
+        
         ckpt = {
             "step": int(update_idx + 1),
             "pi_good": pi_good.state_dict(),
@@ -1109,6 +1128,14 @@ def main():
             "config": vars(args),
             "meta": {"good_in": 10, "adv_in": 8, "n_act": 5},  # MPE simple_adversary spec
         }
+        
+        # Optional: assert shapes before save
+        def _assert_in_dims(sd, want):
+            got = _first_layer_in_dim(sd)
+            assert got == want, f"unexpected in_dim {got}, expected {want}"
+        _assert_in_dims(pi_good.state_dict(), 10)
+        _assert_in_dims(pi_adv.state_dict(), 8)
+        
         _atomic_save(ckpt, last_path)
         print(f"[ckpt] wrote {last_path}")
         
