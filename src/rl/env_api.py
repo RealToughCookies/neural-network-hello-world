@@ -44,6 +44,7 @@ class EnvAdapter(Protocol):
 
 # Global registry for environment adapters
 _REGISTRY: Dict[str, type] = {}
+_DISCOVERED = False
 
 def register(name: str):
     """Decorator to register an environment adapter."""
@@ -52,9 +53,23 @@ def register(name: str):
         return cls
     return _wrap
 
+def _autodiscover():
+    global _DISCOVERED
+    if _DISCOVERED: 
+        return
+    try:
+        import importlib, pkgutil
+        from src.rl import adapters as _pkg
+        for m in pkgutil.iter_modules(_pkg.__path__):
+            importlib.import_module(f"{_pkg.__name__}.{m.name}")
+    except Exception:
+        pass
+    _DISCOVERED = True
+
 def make_adapter(name: str, **kwargs) -> EnvAdapter:
     """Create an environment adapter by name."""
+    _autodiscover()
     if name not in _REGISTRY:
-        available = ", ".join(_REGISTRY.keys())
+        available = ", ".join(sorted(_REGISTRY.keys()))
         raise ValueError(f"Unknown env adapter: {name}. Available: {available}")
     return _REGISTRY[name](**kwargs)

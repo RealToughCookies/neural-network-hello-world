@@ -16,7 +16,7 @@ from src.rl.ppo_selfplay_skeleton import PolicyHead, ValueHead, N_ACT
 from src.rl.selfplay import evaluate
 from src.rl.env_api import make_adapter
 from src.rl.models import MultiHeadPolicy, DimAdapter
-from src.rl.checkpoint import load_policy_from_ckpt, load_legacy_checkpoint
+from src.rl.checkpoint import load_policy_from_ckpt
 import src.rl.adapters  # Import to register adapters
 
 
@@ -111,23 +111,9 @@ def main():
         print(f"[checkpoint obs_dims] good={saved_dims['good']}, adv={saved_dims['adv']}")
         print(f"[model expects] good={saved_dims['good']}, adv={saved_dims['adv']}")
         
-        # Try to load with new role-aware format first
-        try:
-            saved_dims_validated = load_policy_from_ckpt(policy, ckpt, expect_dims=saved_dims, strict=True)
-            print(f"[policy dims] using ckpt dims: good={saved_dims_validated['good']}, adv={saved_dims_validated['adv']}")
-        except (ValueError, RuntimeError, KeyError) as e:
-            # Fall back to legacy format
-            print(f"New format failed ({e}), trying legacy format...")
-            pi_good = PolicyHead(saved_dims["good"], n_act=n_act)
-            pi_adv = PolicyHead(saved_dims["adv"], n_act=n_act)
-            vf_good = ValueHead(saved_dims["good"])
-            vf_adv = ValueHead(saved_dims["adv"])
-            try:
-                load_legacy_checkpoint(pi_good, pi_adv, vf_good, vf_adv, ckpt)
-                print("Legacy checkpoint loaded successfully")
-            except Exception as legacy_err:
-                print(f"Legacy loading also failed: {legacy_err}")
-                raise
+        # Load checkpoint using robust policy loading
+        saved_dims = load_policy_from_ckpt(policy, ckpt, expect_dims=saved_dims)
+        print(f"[policy dims] using ckpt dims: good={saved_dims['good']} adv={saved_dims['adv']}")
         
         # Add adapters if environment dimensions don't match checkpoint
         adapters = {}
@@ -193,18 +179,10 @@ def main():
             print("2/4: vs best.pt...")
             try:
                 best_ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
-                # Try new format first, fall back to legacy
-                try:
-                    opp_policy = MultiHeadPolicy(saved_dims, n_act)
-                    load_policy_from_ckpt(opp_policy, best_ckpt, expect_dims=saved_dims)
-                    opp_pi_good = opp_policy.pi["good"]
-                    opp_pi_adv = opp_policy.pi["adv"]
-                except (ValueError, RuntimeError, KeyError):
-                    # Legacy format
-                    opp_pi_good = PolicyHead(saved_dims["good"], n_act=n_act)
-                    opp_pi_adv = PolicyHead(saved_dims["adv"], n_act=n_act)
-                    opp_pi_good.load_state_dict(best_ckpt["pi_good"])
-                    opp_pi_adv.load_state_dict(best_ckpt["pi_adv"])
+                opp_policy = MultiHeadPolicy(saved_dims, n_act)
+                load_policy_from_ckpt(opp_policy, best_ckpt, expect_dims=saved_dims)
+                opp_pi_good = opp_policy.pi["good"]
+                opp_pi_adv = opp_policy.pi["adv"]
                 
                 # Evaluate with opponent as good agents, learner as adversary
                 _, mean_learner_vs_best = evaluate(adapter.env, opp_pi_good, pi_adv, episodes=args.episodes // 4)
@@ -229,18 +207,10 @@ def main():
                 if opponent_ckpt and Path(opponent_ckpt).exists():
                     try:
                         opp_ckpt = torch.load(opponent_ckpt, map_location="cpu", weights_only=False)
-                        # Try new format first, fall back to legacy
-                        try:
-                            opp_policy = MultiHeadPolicy(saved_dims, n_act)
-                            load_policy_from_ckpt(opp_policy, opp_ckpt, expect_dims=saved_dims)
-                            opp_pi_good = opp_policy.pi["good"]
-                            opp_pi_adv = opp_policy.pi["adv"]
-                        except (ValueError, RuntimeError, KeyError):
-                            # Legacy format
-                            opp_pi_good = PolicyHead(saved_dims["good"], n_act=n_act)
-                            opp_pi_adv = PolicyHead(saved_dims["adv"], n_act=n_act)
-                            opp_pi_good.load_state_dict(opp_ckpt["pi_good"])
-                            opp_pi_adv.load_state_dict(opp_ckpt["pi_adv"])
+                        opp_policy = MultiHeadPolicy(saved_dims, n_act)
+                        load_policy_from_ckpt(opp_policy, opp_ckpt, expect_dims=saved_dims)
+                        opp_pi_good = opp_policy.pi["good"]
+                        opp_pi_adv = opp_policy.pi["adv"]
                         
                         _, learner_reward = evaluate(adapter.env, opp_pi_good, pi_adv, episodes=episodes_per_opponent)
                         if learner_reward > 0:
@@ -267,18 +237,10 @@ def main():
                 if opponent_ckpt and Path(opponent_ckpt).exists():
                     try:
                         opp_ckpt = torch.load(opponent_ckpt, map_location="cpu", weights_only=False)
-                        # Try new format first, fall back to legacy
-                        try:
-                            opp_policy = MultiHeadPolicy(saved_dims, n_act)
-                            load_policy_from_ckpt(opp_policy, opp_ckpt, expect_dims=saved_dims)
-                            opp_pi_good = opp_policy.pi["good"]
-                            opp_pi_adv = opp_policy.pi["adv"]
-                        except (ValueError, RuntimeError, KeyError):
-                            # Legacy format
-                            opp_pi_good = PolicyHead(saved_dims["good"], n_act=n_act)
-                            opp_pi_adv = PolicyHead(saved_dims["adv"], n_act=n_act)
-                            opp_pi_good.load_state_dict(opp_ckpt["pi_good"])
-                            opp_pi_adv.load_state_dict(opp_ckpt["pi_adv"])
+                        opp_policy = MultiHeadPolicy(saved_dims, n_act)
+                        load_policy_from_ckpt(opp_policy, opp_ckpt, expect_dims=saved_dims)
+                        opp_pi_good = opp_policy.pi["good"]
+                        opp_pi_adv = opp_policy.pi["adv"]
                         
                         _, learner_reward = evaluate(adapter.env, opp_pi_good, pi_adv, episodes=episodes_per_opponent)
                         if learner_reward > 0:
