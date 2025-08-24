@@ -12,10 +12,11 @@ from pathlib import Path
 # Add src to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from src.rl.ppo_selfplay_skeleton import PolicyHead, ValueHead, make_env, _load_rl_ckpt, N_ACT
+from src.rl.ppo_selfplay_skeleton import PolicyHead, ValueHead, _load_rl_ckpt, N_ACT
 from src.rl.selfplay import evaluate
-from src.rl.env_utils import get_role_maps
+from src.rl.env_api import make_adapter
 from src.rl.models import DimAdapter
+import src.rl.adapters  # Import to register adapters
 
 
 def main():
@@ -46,13 +47,15 @@ def main():
             listing = "<missing dir>"
         raise SystemExit(f"Checkpoint not found: {ckpt_path}\nDir contents: {listing}")
     
-    # Create environment
+    # Create environment adapter
     try:
-        env = make_env(args.env, seed=args.seed)
+        adapter = make_adapter(args.env, render_mode=None)
+        adapter.reset(seed=args.seed)
         print(f"Created environment: {args.env}")
         
-        # Get role mapping and observation dimensions
-        role_of, obs_dims = get_role_maps(env)
+        # Get role mapping and observation dimensions from adapter
+        role_of = adapter.roles()
+        obs_dims = adapter.obs_dims()
         print(f"[roles] {role_of}")
         print(f"[obs_dims] {obs_dims}")
         
@@ -86,8 +89,8 @@ def main():
         
         print(f"[checkpoint obs_dims] good={saved_dims['good']}, adv={saved_dims['adv']}")
         
-        # Compare saved dimensions vs current env dimensions
-        role_of, env_dims = get_role_maps(env)
+        # Compare saved dimensions vs current adapter dimensions
+        env_dims = adapter.obs_dims()
         print(f"[env obs_dims] good={env_dims['good']}, adv={env_dims['adv']}")
         
         if env_dims != saved_dims:
@@ -190,7 +193,7 @@ def main():
         
         # 1. Self-play (mirror match)
         print("1/4: Self vs self mirror...")
-        mean_good_self, mean_adv_self = evaluate(env, pi_good, pi_adv, episodes=args.episodes // 4)
+        mean_good_self, mean_adv_self = evaluate(adapter.env, pi_good, pi_adv, episodes=args.episodes // 4)
         results['wr_self'] = 0.5  # Always 50% in self-play
         print(f"   Self-play: good={mean_good_self:.3f}, adv={mean_adv_self:.3f}")
         
@@ -206,7 +209,7 @@ def main():
                 opp_pi_adv.load_state_dict(best_ckpt["pi_adv"])
                 
                 # Evaluate with opponent as good agents, learner as adversary
-                _, mean_learner_vs_best = evaluate(env, opp_pi_good, pi_adv, episodes=args.episodes // 4)
+                _, mean_learner_vs_best = evaluate(adapter.env, opp_pi_good, pi_adv, episodes=args.episodes // 4)
                 results['wr_best'] = 1.0 if mean_learner_vs_best > 0 else 0.0  # Win if positive reward
                 print(f"   vs best.pt: learner_reward={mean_learner_vs_best:.3f}")
             except Exception as e:
@@ -233,7 +236,7 @@ def main():
                         opp_pi_good.load_state_dict(opp_ckpt["pi_good"])
                         opp_pi_adv.load_state_dict(opp_ckpt["pi_adv"])
                         
-                        _, learner_reward = evaluate(env, opp_pi_good, pi_adv, episodes=episodes_per_opponent)
+                        _, learner_reward = evaluate(adapter.env, opp_pi_good, pi_adv, episodes=episodes_per_opponent)
                         if learner_reward > 0:
                             uniform_wins += 1
                         uniform_games += 1
@@ -263,7 +266,7 @@ def main():
                         opp_pi_good.load_state_dict(opp_ckpt["pi_good"])
                         opp_pi_adv.load_state_dict(opp_ckpt["pi_adv"])
                         
-                        _, learner_reward = evaluate(env, opp_pi_good, pi_adv, episodes=episodes_per_opponent)
+                        _, learner_reward = evaluate(adapter.env, opp_pi_good, pi_adv, episodes=episodes_per_opponent)
                         if learner_reward > 0:
                             prioritized_wins += 1
                         prioritized_games += 1
