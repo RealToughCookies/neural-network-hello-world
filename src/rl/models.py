@@ -26,6 +26,7 @@ class MultiHeadPolicy(nn.Module):
     """
     Multi-head policy network with separate heads for different agent roles.
     Each role gets its own input layer to handle different observation dimensions.
+    Uses role-keyed ModuleDicts for safe checkpoint loading.
     """
     
     def __init__(self, obs_dims: Dict[str, int], n_actions: int = 5):
@@ -33,40 +34,29 @@ class MultiHeadPolicy(nn.Module):
         self.obs_dims = obs_dims
         self.n_actions = n_actions
         
-        # Create separate policy heads for each role
-        self.heads = nn.ModuleDict()
-        for role, obs_dim in obs_dims.items():
-            self.heads[role] = nn.Sequential(
-                nn.Linear(obs_dim, 64),
-                nn.Tanh(),
-                nn.Linear(64, 64), 
-                nn.Tanh(),
-                nn.Linear(64, n_actions)
-            )
+        # Create role-keyed ModuleDict for policy heads
+        self.pi = nn.ModuleDict()
+        self.vf = nn.ModuleDict()
         
-        # Optional adapters for dimension mismatches
-        self.adapters = nn.ModuleDict()
+        for role, obs_dim in obs_dims.items():
+            self.pi[role] = PolicyHead(obs_dim, n_actions)
+            self.vf[role] = ValueHead(obs_dim)
+    
+    def act(self, role: str, obs: torch.Tensor) -> torch.Tensor:
+        """Get policy logits for specific role."""
+        if role not in self.pi:
+            raise ValueError(f"Unknown role: {role}. Available: {list(self.pi.keys())}")
+        return self.pi[role](obs)
+    
+    def value(self, role: str, obs: torch.Tensor) -> torch.Tensor:
+        """Get value estimate for specific role."""
+        if role not in self.vf:
+            raise ValueError(f"Unknown role: {role}. Available: {list(self.vf.keys())}")
+        return self.vf[role](obs)
     
     def forward(self, role: str, obs: torch.Tensor) -> torch.Tensor:
-        """Forward pass for specific role."""
-        if role not in self.heads:
-            raise ValueError(f"Unknown role: {role}. Available: {list(self.heads.keys())}")
-        
-        # Apply adapter if needed
-        if role in self.adapters:
-            obs = self.adapters[role](obs)
-        
-        return self.heads[role](obs)
-    
-    def add_adapter(self, role: str, env_dim: int, ckpt_dim: int):
-        """Add dimension adapter for a specific role."""
-        if env_dim != ckpt_dim:
-            self.adapters[role] = DimAdapter(env_dim, ckpt_dim)
-            print(f"WARNING: Added adapter for role '{role}': env_dim={env_dim} -> ckpt_dim={ckpt_dim}")
-    
-    def get_role_head(self, role: str) -> nn.Module:
-        """Get the policy head for a specific role."""
-        return self.heads[role]
+        """Forward pass for specific role (backward compatibility)."""
+        return self.act(role, obs)
 
 
 class MultiHeadValue(nn.Module):

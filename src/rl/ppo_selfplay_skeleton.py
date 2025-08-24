@@ -16,6 +16,9 @@ from pathlib import Path
 # Import new modules
 from src.rl.env_utils import get_role_maps
 from src.rl.models import MultiHeadPolicy, MultiHeadValue, PolicyHead, ValueHead, DimAdapter
+from src.rl.env_api import make_adapter
+from src.rl.checkpoint import save_checkpoint, load_policy_from_ckpt, load_legacy_checkpoint
+import src.rl.adapters  # Import to register adapters
 
 N_ACT = 5  # Simple Adversary discrete actions: no-op, left, right, down, up
 
@@ -105,7 +108,7 @@ class ValueHead(nn.Module):
 
 
 def _select_opponent(pool, pi_good, pi_adv, vf_good, vf_adv, 
-                    rng: np.random.Generator, args) -> tuple:
+                    rng: np.random.Generator, args, obs_dims: dict, n_act: int = N_ACT) -> tuple:
     """
     Select opponent for training episode.
     
@@ -115,10 +118,10 @@ def _select_opponent(pool, pi_good, pi_adv, vf_good, vf_adv,
     # Self-play with probability args.opp_min_selfplay_frac
     if rng.random() < args.opp_min_selfplay_frac:
         # Mirror current weights
-        opp_pi_good = PolicyHead(obs_dims["good"], n_act=N_ACT)
-        opp_pi_adv = PolicyHead(obs_dims["adv"], n_act=N_ACT)
-        opp_vf_good = ValueHead(10)
-        opp_vf_adv = ValueHead(8)
+        opp_pi_good = PolicyHead(obs_dims["good"], n_act=n_act)
+        opp_pi_adv = PolicyHead(obs_dims["adv"], n_act=n_act)
+        opp_vf_good = ValueHead(obs_dims["good"])
+        opp_vf_adv = ValueHead(obs_dims["adv"])
         
         opp_pi_good.load_state_dict(pi_good.state_dict())
         opp_pi_adv.load_state_dict(pi_adv.state_dict())
@@ -139,17 +142,21 @@ def _select_opponent(pool, pi_good, pi_adv, vf_good, vf_adv,
                 # Load opponent checkpoint
                 ckpt = torch.load(selected_ckpt, map_location="cpu", weights_only=False)
                 
-                # Create opponent networks
-                opp_pi_good = PolicyHead(10, n_act=N_ACT)
-                opp_pi_adv = PolicyHead(8, n_act=N_ACT) 
-                opp_vf_good = ValueHead(10)
-                opp_vf_adv = ValueHead(8)
-                
-                # Load opponent weights
-                opp_pi_good.load_state_dict(ckpt["pi_good"])
-                opp_pi_adv.load_state_dict(ckpt["pi_adv"])
-                opp_vf_good.load_state_dict(ckpt["vf_good"])
-                opp_vf_adv.load_state_dict(ckpt["vf_adv"])
+                # Try new role-aware format first
+                try:
+                    opp_policy = MultiHeadPolicy(obs_dims, n_act)
+                    load_policy_from_ckpt(opp_policy, ckpt, expect_dims=obs_dims)
+                    opp_pi_good = opp_policy.pi["good"]
+                    opp_pi_adv = opp_policy.pi["adv"]
+                    opp_vf_good = opp_policy.vf["good"]
+                    opp_vf_adv = opp_policy.vf["adv"]
+                except (ValueError, RuntimeError, KeyError):
+                    # Fall back to legacy format
+                    opp_pi_good = PolicyHead(obs_dims["good"], n_act=n_act)
+                    opp_pi_adv = PolicyHead(obs_dims["adv"], n_act=n_act) 
+                    opp_vf_good = ValueHead(obs_dims["good"])
+                    opp_vf_adv = ValueHead(obs_dims["adv"])
+                    load_legacy_checkpoint(opp_pi_good, opp_pi_adv, opp_vf_good, opp_vf_adv, ckpt)
                 
                 source = f"pool_{args.opp_sample}"
                 return opp_pi_good, opp_pi_adv, opp_vf_good, opp_vf_adv, source, selected_ckpt
@@ -157,10 +164,10 @@ def _select_opponent(pool, pi_good, pi_adv, vf_good, vf_adv,
                 print(f"Failed to load opponent {selected_ckpt}: {e}, falling back to self")
     
     # Fallback to self-mirror
-    opp_pi_good = PolicyHead(obs_dims["good"], n_act=N_ACT)
-    opp_pi_adv = PolicyHead(obs_dims["adv"], n_act=N_ACT)
-    opp_vf_good = ValueHead(10) 
-    opp_vf_adv = ValueHead(8)
+    opp_pi_good = PolicyHead(obs_dims["good"], n_act=n_act)
+    opp_pi_adv = PolicyHead(obs_dims["adv"], n_act=n_act)
+    opp_vf_good = ValueHead(obs_dims["good"]) 
+    opp_vf_adv = ValueHead(obs_dims["adv"])
     
     opp_pi_good.load_state_dict(pi_good.state_dict())
     opp_pi_adv.load_state_dict(pi_adv.state_dict())
@@ -312,6 +319,109 @@ def _act_for_keys(keys, obs_dict, pi_good, pi_adv, device="cpu"):
                    in zip(adv_keys, a_a.cpu().numpy(), logp_a.detach().cpu().numpy())})
     
     return out
+
+
+def collect_parallel_adapter(adapter, pi_good_l, pi_adv_l, pi_good_o, pi_adv_o, vf_good, vf_adv, learner_role="good", steps=512, device="cpu"):
+    """Collect per-agent trajectories from environment adapter with role-specific heads."""
+    import torch
+    import numpy as np
+    
+    # Reset environment
+    ts = adapter.reset()
+    
+    t = 0
+    traj = []  # list of (obs, act, logp, rew, val, done, role)
+    ep_rew = 0.0
+    printed_roles = False
+    
+    role_of = adapter.roles()
+    obs_dims = adapter.obs_dims()
+    
+    while t < steps:
+        obs = ts.obs
+        
+        # Split agents by role
+        good_agents = [name for name, role in role_of.items() if role == "good"]
+        adv_agents = [name for name, role in role_of.items() if role == "adv"]
+        L_agents = good_agents if learner_role == "good" else adv_agents
+        O_agents = adv_agents if learner_role == "good" else good_agents
+        
+        # Print role info once
+        if not printed_roles:
+            good_dim = obs_dims.get("good", 0)
+            adv_dim = obs_dims.get("adv", 0)
+            print(f"[roles] good_dim={good_dim} adv_dim={adv_dim} (n_good={len(good_agents)} n_adv={len(adv_agents)})")
+            printed_roles = True
+        
+        # Learner and opponent actions using role-specific heads
+        learner_acts = _act_for_agents(L_agents, obs, role_of, pi_good_l, pi_adv_l, device)
+        opponent_acts = _act_for_agents(O_agents, obs, role_of, pi_good_o, pi_adv_o, device)
+        
+        # Build action dictionary
+        act_dict = {k: v[0] for k, v in learner_acts.items()}  # Extract action (not logp)
+        act_dict.update({k: v[0] for k, v in opponent_acts.items()})
+        
+        # Environment step
+        try:
+            ts = adapter.step(act_dict)
+        except Exception as e:
+            print(f"Environment step error: {e}, breaking")
+            break
+        
+        # Record per-agent samples for learner-controlled agents
+        for agent_name in L_agents:
+            if agent_name in obs:
+                ob = np.asarray(obs[agent_name], dtype=np.float32)
+                ac, lp = learner_acts[agent_name]
+                rw = float(ts.rewards.get(agent_name, 0.0))
+                done = bool(ts.dones.get(agent_name, False))
+                
+                # Use appropriate value head based on role
+                role = role_of[agent_name]
+                with torch.no_grad():
+                    if role == "good":
+                        val = float(vf_good(torch.tensor(ob)[None]).item())
+                    else:
+                        val = float(vf_adv(torch.tensor(ob)[None]).item())
+                
+                traj.append((ob, int(ac), float(lp), rw, val, done, role))
+                ep_rew += rw
+        
+        t += 1
+        
+        # Check if episode is done
+        if any(ts.dones.values()):
+            break
+    
+    print(f"Collected {len(traj)} per-agent samples via parallel API (opponent: {source if 'source' in locals() else 'unknown'})")
+    return ep_rew, traj
+
+
+def _act_for_agents(agent_names, obs, role_of, pi_good, pi_adv, device):
+    """Generate actions for specific agents using role-specific policies."""
+    import torch
+    acts = {}
+    
+    for agent_name in agent_names:
+        if agent_name not in obs:
+            continue
+            
+        role = role_of[agent_name]
+        ob = torch.tensor(obs[agent_name], dtype=torch.float32).to(device)
+        
+        with torch.no_grad():
+            if role == "good":
+                logits = pi_good(ob[None])
+            else:
+                logits = pi_adv(ob[None])
+            
+            dist = torch.distributions.Categorical(logits=logits)
+            ac = dist.sample()
+            lp = dist.log_prob(ac)
+        
+        acts[agent_name] = (int(ac.item()), float(lp.item()))
+    
+    return acts
 
 
 def collect_parallel_mpe(env, pi_good_l, pi_adv_l, pi_good_o, pi_adv_o, vf_good, vf_adv, learner_role="good", steps=512, device="cpu"):
@@ -639,7 +749,7 @@ def _save_rl_ckpt(path, step, pi_good, vf_good, pi_adv, vf_adv, opt, pool, confi
     }, path, _use_new_zipfile_serialization=False)
 
 
-def _load_rl_ckpt_strict(path, env, allow_dim_adapter=False):
+def _load_rl_ckpt_strict(path, adapter, allow_dim_adapter=False):
     """
     STRICT: Load RL checkpoint using only checkpoint dimensions.
     Returns tuple: (ckpt, pi_good, vf_good, pi_adv, vf_adv, adapters)
@@ -656,9 +766,8 @@ def _load_rl_ckpt_strict(path, env, allow_dim_adapter=False):
     
     print(f"[checkpoint obs_dims] good={saved_dims['good']}, adv={saved_dims['adv']}")
     
-    # Compare saved dimensions vs current env dimensions  
-    from src.rl.env_utils import get_role_maps
-    role_of, env_dims = get_role_maps(env)
+    # Compare saved dimensions vs current adapter dimensions  
+    env_dims = adapter.obs_dims()
     print(f"[env obs_dims] good={env_dims['good']}, adv={env_dims['adv']}")
     
     if env_dims != saved_dims:
@@ -738,22 +847,25 @@ def selfplay_smoke_train(steps=1024):
     from src.rl.selfplay import OpponentPool, Matchmaker, evaluate
     import os
     
-    # Create MPE2 environment
-    env = make_env("mpe_adversary", seed=0)
+    # Create environment adapter
+    adapter = make_adapter("mpe_adversary", render_mode=None)
+    adapter.reset(seed=0)
     
-    # Get role mapping and observation dimensions
-    role_of, obs_dims = get_role_maps(env)
+    # Get role mapping and observation dimensions from adapter
+    role_of = adapter.roles()
+    obs_dims = adapter.obs_dims()
+    n_act = adapter.n_actions()
     
     # Create role-specific policy and value heads using dynamic observation dimensions
-    pi_good = PolicyHead(obs_dims["good"], n_act=N_ACT)
+    pi_good = PolicyHead(obs_dims["good"], n_act=n_act)
     vf_good = ValueHead(obs_dims["good"])
-    pi_adv = PolicyHead(obs_dims["adv"], n_act=N_ACT)
+    pi_adv = PolicyHead(obs_dims["adv"], n_act=n_act)
     vf_adv = ValueHead(obs_dims["adv"])
     
     # Create opponent copies
-    pi_good_opp = PolicyHead(obs_dims["good"], n_act=N_ACT)
+    pi_good_opp = PolicyHead(obs_dims["good"], n_act=n_act)
     vf_good_opp = ValueHead(obs_dims["good"])
-    pi_adv_opp = PolicyHead(obs_dims["adv"], n_act=N_ACT)
+    pi_adv_opp = PolicyHead(obs_dims["adv"], n_act=n_act)
     vf_adv_opp = ValueHead(obs_dims["adv"])
     
     # Initialize opponents as copies of learners
@@ -806,8 +918,8 @@ def selfplay_smoke_train(steps=1024):
         # Pick opponent for this episode
         opp_pg, opp_pa, source = mm.pick_opponent(pi_good, pi_adv)
         
-        ep_rew, traj = collect_parallel_mpe(
-            env, pi_good, pi_adv, opp_pg, opp_pa, vf_good, vf_adv,
+        ep_rew, traj = collect_parallel_adapter(
+            adapter, pi_good, pi_adv, opp_pg, opp_pa, vf_good, vf_adv,
             learner_role="good", 
             steps=min(steps, 256), 
             device="cpu"
@@ -870,23 +982,40 @@ def selfplay_smoke_train(steps=1024):
         current_step = start_step + update_idx
         save_dir_path = _absdir(save_dir)
         
-        # Always save last checkpoint
+        # Always save last checkpoint  
         last_path = save_dir_path / "last.pt"
+        
+        # Save in both legacy and new format for compatibility
         ckpt_payload = {
             "step": current_step,
+            # Legacy format
             "pi_good": pi_good.state_dict(),
             "vf_good": vf_good.state_dict(),
             "pi_adv": pi_adv.state_dict(),
             "vf_adv": vf_adv.state_dict(),
+            # New role-aware format
+            "model": {
+                "pi.good": pi_good.state_dict(),
+                "vf.good": vf_good.state_dict(), 
+                "pi.adv": pi_adv.state_dict(),
+                "vf.adv": vf_adv.state_dict(),
+            },
             "optimizer": optimizer.state_dict(),
             "pool": [{"pi_good": s.pi_good, "pi_adv": s.pi_adv} for s in getattr(pool, "_items", [])],
             "config": config,
             "meta": {
-                "n_act": N_ACT,
+                "n_act": n_act,
                 "obs_dims": obs_dims,
-                "role_map": {"adversary": "adv", "agent": "good"}
+                "role_map": role_of
             }
         }
+        
+        # Flatten the model state dict for new format
+        model_state = {}
+        for role_key, state_dict in ckpt_payload["model"].items():
+            for param_key, param_value in state_dict.items():
+                model_state[f"{role_key}.{param_key}"] = param_value
+        ckpt_payload["model"] = model_state
         _atomic_save(ckpt_payload, last_path)
         print(f"[ckpt] wrote {last_path}")
         
@@ -1101,6 +1230,34 @@ def dry_run_environment(env, policy, steps=10):
     print("✓ Dry run completed successfully")
 
 
+def dry_run_adapter(adapter, policy, steps=10):
+    """Test environment adapter and policy with random actions."""
+    print(f"\n=== Dry Run Adapter ({steps} steps) ===")
+    
+    # Reset environment
+    ts = adapter.reset()
+    print(f"Initial obs keys: {list(ts.obs.keys())}")
+    print(f"Initial obs shapes: {[(k, v.shape) for k, v in ts.obs.items()]}")
+    
+    for step in range(steps):
+        # Generate random actions for all agents
+        actions = {}
+        for agent_name in adapter.agent_names():
+            actions[agent_name] = np.random.randint(0, adapter.n_actions())
+        
+        # Step environment
+        ts = adapter.step(actions)
+        print(f"Step {step}: actions={actions}")
+        print(f"  rewards={ts.rewards}, any_done={any(ts.dones.values())}")
+        
+        # Reset if any agent is done
+        if any(ts.dones.values()):
+            ts = adapter.reset()
+            print("  Environment reset")
+    
+    print("✓ Dry run adapter completed successfully")
+
+
 def main():
     print(f"[cwd] {os.getcwd()}")
     
@@ -1158,17 +1315,24 @@ def main():
     # Create seeded numpy generator for opponent sampling
     rng = np.random.Generator(np.random.PCG64(args.seed))
     
-    # Load environment
-    env = load_environment(args.env, args.seed)
+    # Create environment adapter
+    adapter = make_adapter(args.env, render_mode=None)
+    adapter.reset(seed=args.seed)
     
-    # Get role mapping and observation dimensions
-    role_of, obs_dims = get_role_maps(env)
+    # Get role mapping and observation dimensions from adapter
+    role_of = adapter.roles()
+    obs_dims = adapter.obs_dims()
+    n_act = adapter.n_actions()
+    agents = adapter.agent_names()
+    
     print(f"[roles] {role_of}")
     print(f"[obs_dims] {obs_dims}")
+    print(f"[n_actions] {n_act}")
+    print(f"[agents] {agents}")
     
     if args.dry_run:
-        policy = PolicyHead(10, n_act=N_ACT)  # Use consistent 5-action head
-        dry_run_environment(env, policy, steps=5)
+        policy = PolicyHead(10, n_act=n_act)  # Use consistent n-action head
+        dry_run_adapter(adapter, policy, steps=5)
         return
     
     if args.train:
@@ -1206,7 +1370,7 @@ def main():
             try:
                 # STRICT: Load checkpoint using checkpoint dimensions only
                 ckpt, pi_good, vf_good, pi_adv, vf_adv, adapters = _load_rl_ckpt_strict(
-                    str(resume_path_obj), env, allow_dim_adapter=args.allow_dim_adapter)
+                    str(resume_path_obj), adapter, allow_dim_adapter=args.allow_dim_adapter)
                 start_update = ckpt.get("step", 0)
                 
                 # Create optimizer after networks are loaded
@@ -1287,12 +1451,12 @@ def main():
         # Pick opponent for this episode
         try:
             opp_pg, opp_pa, opp_vg, opp_va, source, selected_ckpt = _select_opponent(
-                pool, pi_good, pi_adv, vf_good, vf_adv, rng, args
+                pool, pi_good, pi_adv, vf_good, vf_adv, rng, args, obs_dims, n_act
             )
             
             # Collect self-play trajectory
-            ep_rew, traj = collect_parallel_mpe(
-                env, pi_good, pi_adv, opp_pg, opp_pa, vf_good, vf_adv,
+            ep_rew, traj = collect_parallel_adapter(
+                adapter, pi_good, pi_adv, opp_pg, opp_pa, vf_good, vf_adv,
                 learner_role="good", 
                 steps=args.steps, 
                 device="cpu"
@@ -1385,9 +1549,9 @@ def main():
             "pool": [{"pi_good": s.pi_good, "pi_adv": s.pi_adv} for s in getattr(pool, "_items", [])],
             "config": vars(args),
             "meta": {
-                "n_act": N_ACT,
+                "n_act": n_act,
                 "obs_dims": obs_dims,
-                "role_map": {"adversary": "adv", "agent": "good"}
+                "role_map": role_of
             }
         }
         
