@@ -842,6 +842,75 @@ def _load_rl_ckpt(path, pi_good, vf_good, pi_adv, vf_adv, opt=None,
 CSV_HEADER = ["step", "kl_good", "kl_adv", "entropy_good", "entropy_adv", "ret_eval_good", "ret_eval_adv", "opp_source"]
 
 
+def v2_roles_demo_train(steps=512):
+    """Demonstration of v2-roles checkpoint system with MultiHeadPolicy."""
+    from src.rl.selfplay import evaluate
+    from src.rl.checkpoint import save_checkpoint, load_policy_from_ckpt
+    import os
+    
+    # Create environment adapter
+    adapter = make_adapter("mpe_adversary", render_mode=None)
+    adapter.reset(seed=0)
+    
+    # Get role mapping and observation dimensions from adapter
+    role_of = adapter.roles()
+    obs_dims = adapter.obs_dims()
+    n_act = adapter.n_actions()
+    
+    print(f"[v2-demo] roles: {role_of}")
+    print(f"[v2-demo] obs_dims: {obs_dims}")
+    
+    # Create MultiHeadPolicy (v2-roles pattern)
+    policy = MultiHeadPolicy(obs_dims, n_actions=n_act)
+    print(f"[v2-demo] policy state_dict keys: {list(policy.state_dict().keys())[:4]}...")
+    
+    # Single optimizer for all policy parameters  
+    optimizer = torch.optim.Adam(policy.parameters(), lr=3e-4)
+    
+    # Simple training loop (minimal for demo)
+    policy.train()
+    for update_idx in range(2):  # Very short demo
+        # Collect a small batch of experience (dummy for demo)
+        obs_batch = {
+            "good": torch.randn(32, obs_dims["good"]), 
+            "adv": torch.randn(32, obs_dims["adv"])
+        }
+        
+        # Dummy forward pass
+        pi_good_logits = policy.pi["good"](obs_batch["good"])
+        pi_adv_logits = policy.pi["adv"](obs_batch["adv"])
+        loss = pi_good_logits.mean() + pi_adv_logits.mean()  # Dummy loss
+        
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        print(f"[v2-demo] update {update_idx}, loss: {loss.item():.3f}")
+    
+    # Save checkpoint using v2-roles format
+    save_dir = "artifacts/rl_ckpts"
+    os.makedirs(save_dir, exist_ok=True)
+    
+    meta = {
+        "obs_dims": obs_dims,
+        "schema": "v2-roles",
+        "n_act": n_act,
+        "role_map": role_of,
+        "update_idx": 2
+    }
+    
+    v2_path = f"{save_dir}/v2_demo.pt"
+    save_checkpoint(policy, meta, v2_path)
+    print(f"[v2-demo] saved v2-roles checkpoint: {v2_path}")
+    
+    # Verify we can load it back
+    policy_test = MultiHeadPolicy(obs_dims, n_actions=n_act)
+    saved_dims = load_policy_from_ckpt(policy_test, v2_path, expect_dims=obs_dims)
+    print(f"[v2-demo] loaded checkpoint with dims: {saved_dims}")
+    print(f"[v2-demo] ✅ v2-roles demo completed successfully!")
+
+
 def selfplay_smoke_train(steps=1024):
     """Minimal self-play training smoke test."""
     from src.rl.selfplay import OpponentPool, Matchmaker, evaluate
@@ -1268,6 +1337,7 @@ def main():
     parser.add_argument('--dry-run', action='store_true', help='Test environment setup')
     parser.add_argument('--train', action='store_true', help='Run PPO smoke training')
     parser.add_argument('--selfplay', action='store_true', help='Run self-play training')
+    parser.add_argument('--v2-roles-demo', action='store_true', help='Run v2-roles checkpoint demo')
     parser.add_argument('--swap-every', type=int, default=1, help='Update opponent every N episodes')
     parser.add_argument('--pool-cap', type=int, default=5, help='Opponent pool capacity')
     parser.add_argument('--eval-every', type=int, default=1, help='Evaluate every N updates')
@@ -1343,6 +1413,10 @@ def main():
     if args.selfplay:
         success = selfplay_smoke_train(steps=args.steps)
         print(f"Self-play smoke train {'✓ PASSED' if success else '✗ FAILED'}")
+        return
+    
+    if args.v2_roles_demo:
+        v2_roles_demo_train(steps=args.steps)
         return
     
     # Full self-play training loop with robust checkpointing

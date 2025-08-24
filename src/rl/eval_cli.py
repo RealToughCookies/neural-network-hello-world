@@ -16,7 +16,7 @@ from src.rl.ppo_selfplay_skeleton import PolicyHead, ValueHead, N_ACT
 from src.rl.selfplay import evaluate
 from src.rl.env_api import make_adapter
 from src.rl.models import MultiHeadPolicy, DimAdapter
-from src.rl.checkpoint import load_policy_from_ckpt
+from src.rl.checkpoint import load_policy_from_ckpt, load_legacy_checkpoint
 import src.rl.adapters  # Import to register adapters
 
 
@@ -111,9 +111,24 @@ def main():
         print(f"[checkpoint obs_dims] good={saved_dims['good']}, adv={saved_dims['adv']}")
         print(f"[model expects] good={saved_dims['good']}, adv={saved_dims['adv']}")
         
-        # Load checkpoint using robust policy loading
-        saved_dims = load_policy_from_ckpt(policy, ckpt, expect_dims=saved_dims)
-        print(f"[policy dims] using ckpt dims: good={saved_dims['good']} adv={saved_dims['adv']}")
+        # Check checkpoint format and schema
+        try:
+            sd, meta = load_legacy_checkpoint(ckpt_path)
+            schema = meta.get("schema", "unknown")
+            print(f"schema: {schema}")
+            
+            # Validate role structure
+            has_roles = any(k.startswith(("pi.good.","pi.adv.","vf.good.","vf.adv.")) for k in sd.keys())
+            if not has_roles:
+                raise SystemExit("[fatal] legacy checkpoint without role labels. Re-train a new checkpoint after the v2-roles patch.")
+            
+            # Load checkpoint using robust policy loading
+            saved_dims = load_policy_from_ckpt(policy, ckpt, expect_dims=saved_dims)
+            print(f"[policy dims] using ckpt dims: good={saved_dims['good']} adv={saved_dims['adv']}")
+            
+        except Exception as e:
+            print(f"Checkpoint loading failed: {e}")
+            return 1
         
         # Add adapters if environment dimensions don't match checkpoint
         adapters = {}
