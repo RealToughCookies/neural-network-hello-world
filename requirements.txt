@@ -4,3 +4,5 @@ matplotlib
 onnx
 onnxruntime
 pillow
+mpe2
+pettingzoo<1.25

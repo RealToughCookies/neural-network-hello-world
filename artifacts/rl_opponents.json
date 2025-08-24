@@ -1,0 +1,18 @@
+{
+  "opponents": {
+    "/Users/nathanieleades/Dev/Neural Network/artifacts/rl_ckpts/last.pt": {
+      "ckpt": "/Users/nathanieleades/Dev/Neural Network/artifacts/rl_ckpts/last.pt",
+      "wins": 1,
+      "games": 1,
+      "ema_wr": 0.515,
+      "last_seen_step": 5
+    },
+    "/Users/nathanieleades/Dev/Neural Network/artifacts/rl_ckpts/best.pt": {
+      "ckpt": "/Users/nathanieleades/Dev/Neural Network/artifacts/rl_ckpts/best.pt",
+      "wins": 2,
+      "games": 2,
+      "ema_wr": 0.52955,
+      "last_seen_step": 4
+    }
+  }
+}

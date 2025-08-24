@@ -202,6 +202,59 @@ python -m src.predict --backend ts --image my_fashion_item.png
 
 The inference tool automatically preprocesses inputs with the same transforms used during training. Compare mode validates that both TorchScript and ONNX backends produce identical predictions.
 
+## Dota-Class Agent Roadmap
+
+Research plan for scaling reinforcement learning to complex, multi-agent strategy games inspired by OpenAI Five. See [`docs/dota-rl-plan.md`](docs/dota-rl-plan.md) for detailed technical approach and timeline.
+
+**Quick Start:**
+```bash
+# Install MPE2 (primary environment, headless)
+pip install mpe2  # Note: On Python 3.13, fallback uses pettingzoo.mpe
+python -m src.rl.ppo_selfplay_skeleton --dry-run
+```
+
+Alternatives: `--env grf` (Google Research Football) or `--env pistonball` ([PettingZoo](https://pettingzoo.farama.org/)) if MPE2 unavailable.
+
+## PPO Core
+
+Minimal Proximal Policy Optimization implementation with GAE (Generalized Advantage Estimation) and clipped policy loss:
+
+```bash
+# Run PPO smoke training
+python -m src.rl.ppo_selfplay_skeleton --train
+
+# Run self-play training (learner vs frozen opponent) with MPE2
+python -m src.rl.ppo_selfplay_skeleton --selfplay --env mpe_adversary --steps 512
+
+# Test with different rollout length
+python -m src.rl.ppo_selfplay_skeleton --train --steps 512
+```
+
+Features: clipped policy gradients, MSE value loss, entropy regularization, and KL divergence early stopping. Based on Schulman et al. 2017 (PPO) and 2015 (GAE).
+
+Self-play uses frozen snapshots with a small opponent pool; PettingZoo MPE simple_adversary_v3 runs via Parallel API. MPE spec: obs (8)/(10), discrete(5).
+
+The `smoke_train()` function is fully self-contained, creating its own environment and running a complete training cycle without external dependencies.
+
+## RL Checkpoint & Eval
+
+Training automatically saves best/last checkpoints with complete state (policies, optimizers, opponent pools):
+
+```bash
+# Run self-play training with checkpoints
+python -m src.rl.ppo_selfplay_skeleton --selfplay --env mpe_adversary --steps 512 --eval-every 1
+
+# Resume from checkpoint
+python -m src.rl.ppo_selfplay_skeleton --selfplay --resume last
+
+# Evaluate saved checkpoint
+python -m src.rl.eval_cli --ckpt artifacts/rl_ckpts/best.pt --episodes 4 --env mpe_adversary
+```
+
+Checkpoints include policy/value networks for both roles, optimizer state, opponent pool snapshots, and training configuration for complete resumability.
+
+Paths are resolved with `Path.expanduser().resolve()`; checkpoints are written atomically to `artifacts/rl_ckpts/` using temp files and `os.replace()` for corruption-proof saves. PyTorch recommends saving dicts and loading with initialized modules.
+
 ## Run as Module
 
 All FashionMNIST commands use `python -m` to run within the package import system, which resolves the package-absolute imports correctly. This avoids ModuleNotFoundError issues when importing between src modules. Both the CLI and smoke test use the same `run_once()` pipeline for identical training/evaluation behavior.
