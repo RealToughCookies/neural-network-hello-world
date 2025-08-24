@@ -860,6 +860,26 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0):
     
     print(f"PPO: pi={pi_loss:.3f} vf={vf_loss:.3f} kl={kl:.4f} ent={entropy:.3f}")
     
+    # Save checkpoint atomically after PPO update
+    save_dir = _absdir("artifacts/rl_ckpts")
+    last_path = save_dir / "last.pt"
+    best_path = save_dir / "best.pt"
+    
+    ckpt = {
+        "step": 1,
+        "pi_good": policy.state_dict(),
+        "vf_good": value_fn.state_dict(),
+        "pi_adv": policy.state_dict(),  # Same policy for smoke test
+        "vf_adv": value_fn.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "pool": [],
+        "config": {"steps": steps, "env": env_kind, "seed": seed},
+    }
+    _atomic_save(ckpt, last_path)
+    print(f"[ckpt] wrote {last_path}")
+    _atomic_save(ckpt, best_path)
+    print(f"[ckpt] wrote {best_path}")
+    
     # Relaxed success criteria: allow reasonable KL drift and finite losses
     _ensure_artifacts()
     # Use simplified header for single-agent smoke test
