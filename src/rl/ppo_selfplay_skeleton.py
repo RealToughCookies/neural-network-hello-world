@@ -874,6 +874,7 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0):
         "optimizer": optimizer.state_dict(),
         "pool": [],
         "config": {"steps": steps, "env": env_kind, "seed": seed},
+        "meta": {"good_in": 10, "adv_in": 8, "n_act": 5},  # MPE simple_adversary spec
     }
     _atomic_save(ckpt, last_path)
     print(f"[ckpt] wrote {last_path}")
@@ -1106,6 +1107,7 @@ def main():
             "optimizer": optimizer.state_dict(),
             "pool": [{"pi_good": s.pi_good, "pi_adv": s.pi_adv} for s in getattr(pool, "_items", [])],
             "config": vars(args),
+            "meta": {"good_in": 10, "adv_in": 8, "n_act": 5},  # MPE simple_adversary spec
         }
         _atomic_save(ckpt, last_path)
         print(f"[ckpt] wrote {last_path}")
