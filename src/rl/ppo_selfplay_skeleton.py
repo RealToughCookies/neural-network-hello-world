@@ -13,6 +13,10 @@ import csv
 import tempfile
 from pathlib import Path
 
+# Import new modules
+from src.rl.env_utils import get_role_maps
+from src.rl.models import MultiHeadPolicy, MultiHeadValue, PolicyHead, ValueHead, DimAdapter
+
 N_ACT = 5  # Simple Adversary discrete actions: no-op, left, right, down, up
 
 
@@ -98,6 +102,72 @@ class ValueHead(nn.Module):
     
     def forward(self, x): 
         return self.net(x).squeeze(-1)
+
+
+def _select_opponent(pool, pi_good, pi_adv, vf_good, vf_adv, 
+                    rng: np.random.Generator, args) -> tuple:
+    """
+    Select opponent for training episode.
+    
+    Returns:
+        (opp_pi_good, opp_pi_adv, opp_vf_good, opp_vf_adv, source, selected_ckpt_path)
+    """
+    # Self-play with probability args.opp_min_selfplay_frac
+    if rng.random() < args.opp_min_selfplay_frac:
+        # Mirror current weights
+        opp_pi_good = PolicyHead(obs_dims["good"], n_act=N_ACT)
+        opp_pi_adv = PolicyHead(obs_dims["adv"], n_act=N_ACT)
+        opp_vf_good = ValueHead(10)
+        opp_vf_adv = ValueHead(8)
+        
+        opp_pi_good.load_state_dict(pi_good.state_dict())
+        opp_pi_adv.load_state_dict(pi_adv.state_dict())
+        opp_vf_good.load_state_dict(vf_good.state_dict())
+        opp_vf_adv.load_state_dict(vf_adv.state_dict())
+        
+        return opp_pi_good, opp_pi_adv, opp_vf_good, opp_vf_adv, "self", None
+    
+    # Try to sample from pool
+    if pool:
+        if args.opp_sample == "uniform":
+            selected_ckpt = pool.sample_uniform(rng)
+        else:
+            selected_ckpt = pool.sample_prioritized(rng, args.opp_temp)
+        
+        if selected_ckpt and Path(selected_ckpt).exists():
+            try:
+                # Load opponent checkpoint
+                ckpt = torch.load(selected_ckpt, map_location="cpu", weights_only=False)
+                
+                # Create opponent networks
+                opp_pi_good = PolicyHead(10, n_act=N_ACT)
+                opp_pi_adv = PolicyHead(8, n_act=N_ACT) 
+                opp_vf_good = ValueHead(10)
+                opp_vf_adv = ValueHead(8)
+                
+                # Load opponent weights
+                opp_pi_good.load_state_dict(ckpt["pi_good"])
+                opp_pi_adv.load_state_dict(ckpt["pi_adv"])
+                opp_vf_good.load_state_dict(ckpt["vf_good"])
+                opp_vf_adv.load_state_dict(ckpt["vf_adv"])
+                
+                source = f"pool_{args.opp_sample}"
+                return opp_pi_good, opp_pi_adv, opp_vf_good, opp_vf_adv, source, selected_ckpt
+            except Exception as e:
+                print(f"Failed to load opponent {selected_ckpt}: {e}, falling back to self")
+    
+    # Fallback to self-mirror
+    opp_pi_good = PolicyHead(obs_dims["good"], n_act=N_ACT)
+    opp_pi_adv = PolicyHead(obs_dims["adv"], n_act=N_ACT)
+    opp_vf_good = ValueHead(10) 
+    opp_vf_adv = ValueHead(8)
+    
+    opp_pi_good.load_state_dict(pi_good.state_dict())
+    opp_pi_adv.load_state_dict(pi_adv.state_dict())
+    opp_vf_good.load_state_dict(vf_good.state_dict())
+    opp_vf_adv.load_state_dict(vf_adv.state_dict())
+    
+    return opp_pi_good, opp_pi_adv, opp_vf_good, opp_vf_adv, "self_fallback", None
 
 
 class MockEnvironment:
@@ -544,9 +614,18 @@ def _append_csv(path, header, row):
         w.writerow(row)
 
 
-def _save_rl_ckpt(path, step, pi_good, vf_good, pi_adv, vf_adv, opt, pool, config: dict):
+def _save_rl_ckpt(path, step, pi_good, vf_good, pi_adv, vf_adv, opt, pool, config: dict, obs_dims: dict = None):
     """Save RL checkpoint with complete training state."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    
+    # Build metadata with observation dimensions
+    meta = {
+        "n_act": N_ACT,
+        "role_map": {"adversary": "adv", "agent": "good"}
+    }
+    if obs_dims:
+        meta["obs_dims"] = obs_dims
+    
     torch.save({
         "step": step,
         "pi_good": pi_good.state_dict(),
@@ -556,11 +635,90 @@ def _save_rl_ckpt(path, step, pi_good, vf_good, pi_adv, vf_adv, opt, pool, confi
         "optimizer": opt.state_dict(),
         "pool": [{"pi_good": s.pi_good, "pi_adv": s.pi_adv} for s in getattr(pool, "_items", [])],
         "config": config,
+        "meta": meta,
     }, path, _use_new_zipfile_serialization=False)
 
 
-def _load_rl_ckpt(path, pi_good, vf_good, pi_adv, vf_adv, opt=None):
-    """Load RL checkpoint and restore training state."""
+def _load_rl_ckpt_strict(path, env, allow_dim_adapter=False):
+    """
+    STRICT: Load RL checkpoint using only checkpoint dimensions.
+    Returns tuple: (ckpt, pi_good, vf_good, pi_adv, vf_adv, adapters)
+    """
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    
+    # STRICT: Get dimensions from checkpoint metadata only
+    saved_dims = ckpt.get("meta", {}).get("obs_dims")
+    if saved_dims is None:
+        raise ValueError(
+            "Checkpoint missing meta.obs_dims; re-train a small ckpt with the new trainer. "
+            "This checkpoint was created before per-role dimension support was added."
+        )
+    
+    print(f"[checkpoint obs_dims] good={saved_dims['good']}, adv={saved_dims['adv']}")
+    
+    # Compare saved dimensions vs current env dimensions  
+    from src.rl.env_utils import get_role_maps
+    role_of, env_dims = get_role_maps(env)
+    print(f"[env obs_dims] good={env_dims['good']}, adv={env_dims['adv']}")
+    
+    if env_dims != saved_dims:
+        if not allow_dim_adapter:
+            raise ValueError(
+                f"Dimension mismatch: ckpt={saved_dims}, env={env_dims}. "
+                "Pin pettingzoo<1.25 or run with --allow-dim-adapter to insert a Linear adapter."
+            )
+        else:
+            print(f"WARNING: Using dimension adapters for mismatch between ckpt and env dims")
+    
+    n_act = ckpt.get("meta", {}).get("n_act", N_ACT)
+    
+    # Build heads using checkpoint dimensions
+    pi_good = PolicyHead(saved_dims["good"], n_act=n_act)
+    vf_good = ValueHead(saved_dims["good"])
+    pi_adv = PolicyHead(saved_dims["adv"], n_act=n_act) 
+    vf_adv = ValueHead(saved_dims["adv"])
+    
+    # Add adapters if environment dimensions don't match checkpoint
+    adapters = {}
+    if env_dims != saved_dims:
+        for role in ["good", "adv"]:
+            env_dim = env_dims[role]
+            ckpt_dim = saved_dims[role]
+            if env_dim != ckpt_dim:
+                adapters[role] = DimAdapter(env_dim, ckpt_dim)
+                print(f"WARNING: Added adapter for role '{role}': env_dim={env_dim} -> ckpt_dim={ckpt_dim}")
+    
+    # Load state dicts
+    pi_good.load_state_dict(ckpt["pi_good"])
+    vf_good.load_state_dict(ckpt["vf_good"])
+    pi_adv.load_state_dict(ckpt["pi_adv"])
+    vf_adv.load_state_dict(ckpt["vf_adv"])
+    
+    # Apply adapters by wrapping forward methods
+    if adapters:
+        print("[applying dimension adapters to networks]")
+        if "good" in adapters:
+            good_adapter = adapters["good"]
+            original_pi_good_forward = pi_good.forward
+            original_vf_good_forward = vf_good.forward
+            pi_good.forward = lambda x: original_pi_good_forward(good_adapter(x))
+            vf_good.forward = lambda x: original_vf_good_forward(good_adapter(x))
+        if "adv" in adapters:
+            adv_adapter = adapters["adv"]
+            original_pi_adv_forward = pi_adv.forward
+            original_vf_adv_forward = vf_adv.forward
+            pi_adv.forward = lambda x: original_pi_adv_forward(adv_adapter(x))
+            vf_adv.forward = lambda x: original_vf_adv_forward(adv_adapter(x))
+    
+    # Print final dimensions the network expects
+    print(f"Network expects per-role dims: good={saved_dims['good']}, adv={saved_dims['adv']}, n_act={n_act}")
+    
+    return ckpt, pi_good, vf_good, pi_adv, vf_adv, adapters
+
+
+def _load_rl_ckpt(path, pi_good, vf_good, pi_adv, vf_adv, opt=None, 
+                  current_obs_dims=None, allow_dim_adapter=False):
+    """LEGACY: Load RL checkpoint and restore training state.""" 
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     pi_good.load_state_dict(ckpt["pi_good"])
     vf_good.load_state_dict(ckpt["vf_good"])
@@ -583,13 +741,20 @@ def selfplay_smoke_train(steps=1024):
     # Create MPE2 environment
     env = make_env("mpe_adversary", seed=0)
     
-    # Create role-specific policy and value heads
-    pi_good, vf_good = PolicyHead(10, n_act=N_ACT), ValueHead(10)  # Good agents: 10-D obs
-    pi_adv, vf_adv = PolicyHead(8, n_act=N_ACT), ValueHead(8)      # Adversary agents: 8-D obs
+    # Get role mapping and observation dimensions
+    role_of, obs_dims = get_role_maps(env)
+    
+    # Create role-specific policy and value heads using dynamic observation dimensions
+    pi_good = PolicyHead(obs_dims["good"], n_act=N_ACT)
+    vf_good = ValueHead(obs_dims["good"])
+    pi_adv = PolicyHead(obs_dims["adv"], n_act=N_ACT)
+    vf_adv = ValueHead(obs_dims["adv"])
     
     # Create opponent copies
-    pi_good_opp, vf_good_opp = PolicyHead(10, n_act=N_ACT), ValueHead(10)
-    pi_adv_opp, vf_adv_opp = PolicyHead(8, n_act=N_ACT), ValueHead(8)
+    pi_good_opp = PolicyHead(obs_dims["good"], n_act=N_ACT)
+    vf_good_opp = ValueHead(obs_dims["good"])
+    pi_adv_opp = PolicyHead(obs_dims["adv"], n_act=N_ACT)
+    vf_adv_opp = ValueHead(obs_dims["adv"])
     
     # Initialize opponents as copies of learners
     pi_good_opp.load_state_dict(pi_good.state_dict())
@@ -613,29 +778,9 @@ def selfplay_smoke_train(steps=1024):
     best_score = float('-inf')
     save_dir = "artifacts/rl_ckpts"  # Default save directory
     
-    # Resume from checkpoint if specified
+    # Resume from checkpoint if specified (disabled in smoke test)
     resume_path = ""  # This would come from args in main training
-    if resume_path:
-        if resume_path in ["best", "last"]:
-            resume_path = f"{save_dir}/{resume_path}.pt"
-        
-        if os.path.exists(resume_path):
-            try:
-                ckpt = _load_rl_ckpt(resume_path, pi_good, vf_good, pi_adv, vf_adv, optimizer)
-                start_step = ckpt.get("step", 0)
-                
-                # Restore opponent pool
-                if "pool" in ckpt:
-                    pool._items = []
-                    for item in ckpt["pool"]:
-                        from src.rl.selfplay import OpponentSnapshot
-                        snap = OpponentSnapshot(item["pi_good"], item["pi_adv"])
-                        pool._items.append(snap)
-                
-                print(f"Resumed from checkpoint: {resume_path} (step {start_step})")
-            except Exception as e:
-                print(f"Failed to load checkpoint {resume_path}: {e}")
-                start_step = 0
+    # Note: For smoke test, we don't resume from checkpoints
     
     # CSV logging setup
     os.makedirs("artifacts", exist_ok=True)
@@ -646,10 +791,10 @@ def selfplay_smoke_train(steps=1024):
     
     update_idx = 0
     
-    # Get initial entropy
+    # Get initial entropy for good agents
     with torch.no_grad():
-        test_obs = torch.randn(1, obs_dim)
-        logits = learner(test_obs)
+        test_obs = torch.randn(1, obs_dims["good"])
+        logits = pi_good(test_obs)
         dist = torch.distributions.Categorical(logits=logits)
         ent0 = dist.entropy().item()
     
@@ -716,8 +861,7 @@ def selfplay_smoke_train(steps=1024):
         vf_good_opp.load_state_dict(vf_good.state_dict())
         vf_adv_opp.load_state_dict(vf_adv.state_dict())
         
-        # Update opponent pool
-        pool.push(pi_good, pi_adv)
+        # Opponent pool is updated via checkpoint saving
         
         update_idx += 1
         
@@ -737,6 +881,11 @@ def selfplay_smoke_train(steps=1024):
             "optimizer": optimizer.state_dict(),
             "pool": [{"pi_good": s.pi_good, "pi_adv": s.pi_adv} for s in getattr(pool, "_items", [])],
             "config": config,
+            "meta": {
+                "n_act": N_ACT,
+                "obs_dims": obs_dims,
+                "role_map": {"adversary": "adv", "agent": "good"}
+            }
         }
         _atomic_save(ckpt_payload, last_path)
         print(f"[ckpt] wrote {last_path}")
@@ -796,9 +945,13 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0):
     # Create environment
     env = make_env(env_kind, seed)
     
+    # Get role mapping and observation dimensions
+    role_of, obs_dims = get_role_maps(env)
+    
     from src.rl.ppo_core import ppo_update
     
-    obs_dim = 10
+    # Use good agent dimensions for smoke test (could use either)
+    obs_dim = obs_dims["good"]
     action_dim = 4  # Mock environment action space
     
     # Create networks (use role-specific heads for consistency)
@@ -880,7 +1033,11 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0):
         "optimizer": optimizer.state_dict(),
         "pool": [],
         "config": {"steps": steps, "env": env_kind, "seed": seed},
-        "meta": {"good_in": 10, "adv_in": 8, "n_act": 5},  # MPE simple_adversary spec
+        "meta": {
+            "n_act": N_ACT,
+            "obs_dims": obs_dims,
+            "role_map": {"adversary": "adv", "agent": "good"}
+        }
     }
     
     # Optional: assert shapes before save
@@ -918,14 +1075,24 @@ def dry_run_environment(env, policy, steps=10):
         print(f"Observation type: {type(obs)}")
     
     for step in range(steps):
-        # Random action for simplicity
-        if hasattr(env.action_space, 'n'):
-            action = env.action_space.sample()
+        # Random action for simplicity - handle parallel API
+        if hasattr(env, 'possible_agents'):
+            # Parallel API - need dict of actions
+            actions = {}
+            for agent in env.possible_agents:
+                if hasattr(env.action_space(agent), 'n'):
+                    actions[agent] = env.action_space(agent).sample()
+                else:
+                    actions[agent] = 0
         else:
-            action = 0  # Fallback
+            # Single agent fallback
+            if hasattr(env.action_space, 'n'):
+                actions = env.action_space.sample()
+            else:
+                actions = 0  # Fallback
         
-        obs, reward, done, info = env.step(action)
-        print(f"Step {step}: action={action}, reward={reward:.3f}, done={done}")
+        obs, reward, done, truncated, info = env.step(actions)
+        print(f"Step {step}: actions={actions}, reward={reward}, done={done}")
         
         if done:
             obs = env.reset()
@@ -951,15 +1118,53 @@ def main():
     parser.add_argument('--save-dir', default='artifacts/rl_ckpts', help='Checkpoint directory')
     parser.add_argument('--resume', default='', help='Resume from checkpoint (path, "best", or "last")')
     parser.add_argument('--updates', type=int, default=10, help='Number of PPO updates')
+    
+    # Opponent pool arguments
+    parser.add_argument('--opp-sample', choices=['prioritized', 'uniform'], default='prioritized',
+                       help='Opponent sampling strategy')
+    parser.add_argument('--opp-min-selfplay-frac', type=float, default=0.10,
+                       help='Minimum fraction of episodes to play self vs self')
+    parser.add_argument('--opp-temp', type=float, default=0.7,
+                       help='Temperature for prioritized opponent sampling')
+    parser.add_argument('--opp-ema-decay', type=float, default=0.97,
+                       help='EMA decay factor for opponent win rates')
+    parser.add_argument('--opp-max', type=int, default=64,
+                       help='Maximum opponents to keep in pool')
+    parser.add_argument('--opp-min-games', type=int, default=5,
+                       help='Minimum games before using EMA win rate')
+    
+    # Dimension handling arguments
+    parser.add_argument('--allow-dim-adapter', action='store_true', default=False,
+                       help='Allow dimension adapter for obs dim mismatches')
+    parser.add_argument('--pin-pz124', action='store_true', default=False,
+                       help='Assert PettingZoo version starts with 1.24')
+    
     args = parser.parse_args()
+    
+    # Check PettingZoo version if requested
+    if args.pin_pz124:
+        try:
+            import pettingzoo
+            if not pettingzoo.__version__.startswith("1.24"):
+                raise SystemExit(f"--pin-pz124 requires PettingZoo 1.24.*, got {pettingzoo.__version__}")
+        except ImportError:
+            raise SystemExit("--pin-pz124 requires PettingZoo to be installed")
     
     # Set seeds
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     
+    # Create seeded numpy generator for opponent sampling
+    rng = np.random.Generator(np.random.PCG64(args.seed))
+    
     # Load environment
     env = load_environment(args.env, args.seed)
+    
+    # Get role mapping and observation dimensions
+    role_of, obs_dims = get_role_maps(env)
+    print(f"[roles] {role_of}")
+    print(f"[obs_dims] {obs_dims}")
     
     if args.dry_run:
         policy = PolicyHead(10, n_act=N_ACT)  # Use consistent 5-action head
@@ -977,33 +1182,15 @@ def main():
         return
     
     # Full self-play training loop with robust checkpointing
-    from src.rl.selfplay import OpponentPool, Matchmaker, evaluate
+    from src.rl.selfplay import evaluate
     from src.rl.ppo_core import ppo_update
+    from src.rl.opponent_pool import OpponentPool
     
     print(f"Starting PPO self-play training: {args.updates} updates, {args.steps} steps/update")
     
-    # Create role-specific policy and value heads
-    pi_good, vf_good = PolicyHead(10, n_act=N_ACT), ValueHead(10)  # Good agents: 10-D obs
-    pi_adv, vf_adv = PolicyHead(8, n_act=N_ACT), ValueHead(8)      # Adversary agents: 8-D obs
-    
-    # Create opponent copies
-    pi_good_opp, vf_good_opp = PolicyHead(10, n_act=N_ACT), ValueHead(10)
-    pi_adv_opp, vf_adv_opp = PolicyHead(8, n_act=N_ACT), ValueHead(8)
-    
-    # Initialize opponents as copies of learners
-    pi_good_opp.load_state_dict(pi_good.state_dict())
-    pi_adv_opp.load_state_dict(pi_adv.state_dict())
-    
-    # Single optimizer for all learner parameters
-    optimizer = torch.optim.Adam(
-        list(pi_good.parameters()) + list(vf_good.parameters()) +
-        list(pi_adv.parameters()) + list(vf_adv.parameters()), 
-        lr=3e-4
-    )
-    
-    # Initialize opponent pool and matchmaker
-    pool = OpponentPool(cap=args.pool_cap)
-    mm = Matchmaker(pool, p_latest=0.5)
+    # Initialize opponent pool
+    pool = OpponentPool("artifacts/rl_opponents.json", args.opp_max, args.opp_ema_decay, args.opp_min_games)
+    print(f"Opponent pool: {len(pool)} opponents loaded")
     
     # Checkpoint and resume logic
     start_update = 0
@@ -1017,8 +1204,19 @@ def main():
         resume_path_obj = _absdir(resume_path)
         if resume_path_obj.exists():
             try:
-                ckpt = _load_rl_ckpt(str(resume_path_obj), pi_good, vf_good, pi_adv, vf_adv, optimizer)
+                # STRICT: Load checkpoint using checkpoint dimensions only
+                ckpt, pi_good, vf_good, pi_adv, vf_adv, adapters = _load_rl_ckpt_strict(
+                    str(resume_path_obj), env, allow_dim_adapter=args.allow_dim_adapter)
                 start_update = ckpt.get("step", 0)
+                
+                # Create optimizer after networks are loaded
+                optimizer = torch.optim.Adam(
+                    list(pi_good.parameters()) + list(vf_good.parameters()) +
+                    list(pi_adv.parameters()) + list(vf_adv.parameters()), 
+                    lr=3e-4
+                )
+                if "optimizer" in ckpt:
+                    optimizer.load_state_dict(ckpt["optimizer"])
                 
                 # Restore opponent pool
                 if "pool" in ckpt:
@@ -1031,9 +1229,54 @@ def main():
                 print(f"Resumed from checkpoint: {resume_path_obj} (update {start_update})")
             except Exception as e:
                 print(f"Failed to load checkpoint {resume_path_obj}: {e}")
-                start_update = 0
+                print("Creating new networks from environment dimensions")
+                # Create new networks from environment dimensions
+                pi_good = PolicyHead(obs_dims["good"], n_act=N_ACT)
+                vf_good = ValueHead(obs_dims["good"])
+                pi_adv = PolicyHead(obs_dims["adv"], n_act=N_ACT) 
+                vf_adv = ValueHead(obs_dims["adv"])
+                
+                optimizer = torch.optim.Adam(
+                    list(pi_good.parameters()) + list(vf_good.parameters()) +
+                    list(pi_adv.parameters()) + list(vf_adv.parameters()), 
+                    lr=3e-4
+                )
         else:
             print(f"Checkpoint not found: {resume_path_obj}")
+            print("Creating new networks from environment dimensions")
+            # Create new networks from environment dimensions
+            pi_good = PolicyHead(obs_dims["good"], n_act=N_ACT)
+            vf_good = ValueHead(obs_dims["good"])
+            pi_adv = PolicyHead(obs_dims["adv"], n_act=N_ACT) 
+            vf_adv = ValueHead(obs_dims["adv"])
+            
+            optimizer = torch.optim.Adam(
+                list(pi_good.parameters()) + list(vf_good.parameters()) +
+                list(pi_adv.parameters()) + list(vf_adv.parameters()), 
+                lr=3e-4
+            )
+    else:
+        # Create role-specific policy and value heads using dynamic observation dimensions
+        pi_good = PolicyHead(obs_dims["good"], n_act=N_ACT)
+        vf_good = ValueHead(obs_dims["good"])
+        pi_adv = PolicyHead(obs_dims["adv"], n_act=N_ACT) 
+        vf_adv = ValueHead(obs_dims["adv"])
+        
+        optimizer = torch.optim.Adam(
+            list(pi_good.parameters()) + list(vf_good.parameters()) +
+            list(pi_adv.parameters()) + list(vf_adv.parameters()), 
+            lr=3e-4
+        )
+    
+    # Create opponent copies (always use environment dimensions for these)
+    pi_good_opp = PolicyHead(obs_dims["good"], n_act=N_ACT)
+    vf_good_opp = ValueHead(obs_dims["good"])
+    pi_adv_opp = PolicyHead(obs_dims["adv"], n_act=N_ACT)
+    vf_adv_opp = ValueHead(obs_dims["adv"])
+    
+    # Initialize opponents as copies of learners
+    pi_good_opp.load_state_dict(pi_good.state_dict())
+    pi_adv_opp.load_state_dict(pi_adv.state_dict())
     
     # Training loop with robust checkpoint saving
     _ensure_artifacts()
@@ -1043,7 +1286,9 @@ def main():
         
         # Pick opponent for this episode
         try:
-            opp_pg, opp_pa, source = mm.pick_opponent(pi_good, pi_adv)
+            opp_pg, opp_pa, opp_vg, opp_va, source, selected_ckpt = _select_opponent(
+                pool, pi_good, pi_adv, vf_good, vf_adv, rng, args
+            )
             
             # Collect self-play trajectory
             ep_rew, traj = collect_parallel_mpe(
@@ -1053,6 +1298,24 @@ def main():
                 device="cpu"
             )
             print(f"Collected {len(traj)} per-agent samples (opponent: {source})")
+            
+            # Record game result for opponent pool
+            if selected_ckpt and source.startswith("pool_"):
+                # Compute win/loss from episode rewards
+                learner_reward = sum(t[3] for t in traj if t[6] == "good")  # Sum rewards for good agents
+                opponent_reward = -learner_reward  # Approximate opponent reward (zero-sum assumption)
+                
+                if learner_reward > opponent_reward:
+                    won = True
+                elif learner_reward < opponent_reward:
+                    won = False
+                else:
+                    # Tie: record both win and loss with 50% probability each
+                    won = rng.random() < 0.5
+                
+                pool.record_result(selected_ckpt, won)
+                print(f"Recorded {'win' if won else 'loss'} vs {Path(selected_ckpt).name}")
+                
         except Exception as e:
             print(f"Collection failed ({e}), skipping update")
             continue
@@ -1084,12 +1347,7 @@ def main():
             except Exception as e:
                 print(f"PPO update failed for adversary agents: {e}")
         
-        # Update opponents and pool every swap_every updates
-        if (update_idx + 1) % args.swap_every == 0:
-            pi_good_opp.load_state_dict(pi_good.state_dict())
-            pi_adv_opp.load_state_dict(pi_adv.state_dict())
-            pool.push(pi_good, pi_adv)
-            print(f"Updated opponent pool (size: {len(pool._items)})")
+        # Update opponents every swap_every updates (handled by checkpoint saving)
         
         # Run evaluation every eval_every updates
         eval_g = eval_a = 0.0
@@ -1126,7 +1384,11 @@ def main():
             "optimizer": optimizer.state_dict(),
             "pool": [{"pi_good": s.pi_good, "pi_adv": s.pi_adv} for s in getattr(pool, "_items", [])],
             "config": vars(args),
-            "meta": {"good_in": 10, "adv_in": 8, "n_act": 5},  # MPE simple_adversary spec
+            "meta": {
+                "n_act": N_ACT,
+                "obs_dims": obs_dims,
+                "role_map": {"adversary": "adv", "agent": "good"}
+            }
         }
         
         # Optional: assert shapes before save
@@ -1139,12 +1401,17 @@ def main():
         _atomic_save(ckpt, last_path)
         print(f"[ckpt] wrote {last_path}")
         
+        # Add checkpoint to opponent pool
+        pool.add(last_path, int(update_idx + 1))
+        
         # Update best checkpoint based on combined evaluation score
         score = float(eval_g) + float(eval_a)
         if score > best_score:
             best_score = score
             _atomic_save(ckpt, best_path)
             print(f"[ckpt] updated {best_path} (score: {score:.3f})")
+            # Also add best checkpoint to pool
+            pool.add(best_path, int(update_idx + 1))
     
     print(f"\n[done] Completed {args.updates} updates")
 
