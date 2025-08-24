@@ -113,7 +113,7 @@ def load_policy_role_scoped(model, full_sd: Dict[str, torch.Tensor], expect_dims
         model.load_state_dict(leftovers, strict=False)
 
 def load_policy_from_ckpt(model, ckpt: str | Path | dict, expect_dims: Dict[str,int]) -> Dict[str,int]:
-    ck = torch.load(ckpt, map_location="cpu") if not isinstance(ckpt, dict) else ckpt
+    ck = torch.load(ckpt, map_location="cpu", weights_only=False) if not isinstance(ckpt, dict) else ckpt
     sd, meta = _normalize_ckpt_obj(ck)
     saved_dims = meta.get("obs_dims") or expect_dims
     if dict(saved_dims) != dict(expect_dims):
@@ -122,5 +122,5 @@ def load_policy_from_ckpt(model, ckpt: str | Path | dict, expect_dims: Dict[str,
     return saved_dims
 
 def load_legacy_checkpoint(path: str | Path) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
-    ck = torch.load(path, map_location="cpu")
+    ck = torch.load(path, map_location="cpu", weights_only=False)
     return _normalize_ckpt_obj(ck)
