@@ -17,6 +17,7 @@ from pathlib import Path
 from src.rl.env_utils import get_role_maps
 from src.rl.models import MultiHeadPolicy, MultiHeadValue, PolicyHead, ValueHead, DimAdapter
 from src.rl.env_api import make_adapter
+from src.rl.checkpoint import save_checkpoint, load_policy_from_ckpt, load_legacy_checkpoint
 import src.rl.adapters  # Import to register adapters
 
 N_ACT = 5  # Simple Adversary discrete actions: no-op, left, right, down, up
@@ -107,7 +108,7 @@ class ValueHead(nn.Module):
 
 
 def _select_opponent(pool, pi_good, pi_adv, vf_good, vf_adv, 
-                    rng: np.random.Generator, args) -> tuple:
+                    rng: np.random.Generator, args, obs_dims: dict, n_act: int = N_ACT) -> tuple:
     """
     Select opponent for training episode.
     
@@ -117,10 +118,10 @@ def _select_opponent(pool, pi_good, pi_adv, vf_good, vf_adv,
     # Self-play with probability args.opp_min_selfplay_frac
     if rng.random() < args.opp_min_selfplay_frac:
         # Mirror current weights
-        opp_pi_good = PolicyHead(obs_dims["good"], n_act=N_ACT)
-        opp_pi_adv = PolicyHead(obs_dims["adv"], n_act=N_ACT)
-        opp_vf_good = ValueHead(10)
-        opp_vf_adv = ValueHead(8)
+        opp_pi_good = PolicyHead(obs_dims["good"], n_act=n_act)
+        opp_pi_adv = PolicyHead(obs_dims["adv"], n_act=n_act)
+        opp_vf_good = ValueHead(obs_dims["good"])
+        opp_vf_adv = ValueHead(obs_dims["adv"])
         
         opp_pi_good.load_state_dict(pi_good.state_dict())
         opp_pi_adv.load_state_dict(pi_adv.state_dict())
@@ -141,17 +142,21 @@ def _select_opponent(pool, pi_good, pi_adv, vf_good, vf_adv,
                 # Load opponent checkpoint
                 ckpt = torch.load(selected_ckpt, map_location="cpu", weights_only=False)
                 
-                # Create opponent networks
-                opp_pi_good = PolicyHead(10, n_act=N_ACT)
-                opp_pi_adv = PolicyHead(8, n_act=N_ACT) 
-                opp_vf_good = ValueHead(10)
-                opp_vf_adv = ValueHead(8)
-                
-                # Load opponent weights
-                opp_pi_good.load_state_dict(ckpt["pi_good"])
-                opp_pi_adv.load_state_dict(ckpt["pi_adv"])
-                opp_vf_good.load_state_dict(ckpt["vf_good"])
-                opp_vf_adv.load_state_dict(ckpt["vf_adv"])
+                # Try new role-aware format first
+                try:
+                    opp_policy = MultiHeadPolicy(obs_dims, n_act)
+                    load_policy_from_ckpt(opp_policy, ckpt, expect_dims=obs_dims)
+                    opp_pi_good = opp_policy.pi["good"]
+                    opp_pi_adv = opp_policy.pi["adv"]
+                    opp_vf_good = opp_policy.vf["good"]
+                    opp_vf_adv = opp_policy.vf["adv"]
+                except (ValueError, RuntimeError, KeyError):
+                    # Fall back to legacy format
+                    opp_pi_good = PolicyHead(obs_dims["good"], n_act=n_act)
+                    opp_pi_adv = PolicyHead(obs_dims["adv"], n_act=n_act) 
+                    opp_vf_good = ValueHead(obs_dims["good"])
+                    opp_vf_adv = ValueHead(obs_dims["adv"])
+                    load_legacy_checkpoint(opp_pi_good, opp_pi_adv, opp_vf_good, opp_vf_adv, ckpt)
                 
                 source = f"pool_{args.opp_sample}"
                 return opp_pi_good, opp_pi_adv, opp_vf_good, opp_vf_adv, source, selected_ckpt
@@ -159,10 +164,10 @@ def _select_opponent(pool, pi_good, pi_adv, vf_good, vf_adv,
                 print(f"Failed to load opponent {selected_ckpt}: {e}, falling back to self")
     
     # Fallback to self-mirror
-    opp_pi_good = PolicyHead(obs_dims["good"], n_act=N_ACT)
-    opp_pi_adv = PolicyHead(obs_dims["adv"], n_act=N_ACT)
-    opp_vf_good = ValueHead(10) 
-    opp_vf_adv = ValueHead(8)
+    opp_pi_good = PolicyHead(obs_dims["good"], n_act=n_act)
+    opp_pi_adv = PolicyHead(obs_dims["adv"], n_act=n_act)
+    opp_vf_good = ValueHead(obs_dims["good"]) 
+    opp_vf_adv = ValueHead(obs_dims["adv"])
     
     opp_pi_good.load_state_dict(pi_good.state_dict())
     opp_pi_adv.load_state_dict(pi_adv.state_dict())
@@ -977,14 +982,24 @@ def selfplay_smoke_train(steps=1024):
         current_step = start_step + update_idx
         save_dir_path = _absdir(save_dir)
         
-        # Always save last checkpoint
+        # Always save last checkpoint  
         last_path = save_dir_path / "last.pt"
+        
+        # Save in both legacy and new format for compatibility
         ckpt_payload = {
             "step": current_step,
+            # Legacy format
             "pi_good": pi_good.state_dict(),
             "vf_good": vf_good.state_dict(),
             "pi_adv": pi_adv.state_dict(),
             "vf_adv": vf_adv.state_dict(),
+            # New role-aware format
+            "model": {
+                "pi.good": pi_good.state_dict(),
+                "vf.good": vf_good.state_dict(), 
+                "pi.adv": pi_adv.state_dict(),
+                "vf.adv": vf_adv.state_dict(),
+            },
             "optimizer": optimizer.state_dict(),
             "pool": [{"pi_good": s.pi_good, "pi_adv": s.pi_adv} for s in getattr(pool, "_items", [])],
             "config": config,
@@ -994,6 +1009,13 @@ def selfplay_smoke_train(steps=1024):
                 "role_map": role_of
             }
         }
+        
+        # Flatten the model state dict for new format
+        model_state = {}
+        for role_key, state_dict in ckpt_payload["model"].items():
+            for param_key, param_value in state_dict.items():
+                model_state[f"{role_key}.{param_key}"] = param_value
+        ckpt_payload["model"] = model_state
         _atomic_save(ckpt_payload, last_path)
         print(f"[ckpt] wrote {last_path}")
         
@@ -1429,7 +1451,7 @@ def main():
         # Pick opponent for this episode
         try:
             opp_pg, opp_pa, opp_vg, opp_va, source, selected_ckpt = _select_opponent(
-                pool, pi_good, pi_adv, vf_good, vf_adv, rng, args
+                pool, pi_good, pi_adv, vf_good, vf_adv, rng, args, obs_dims, n_act
             )
             
             # Collect self-play trajectory
