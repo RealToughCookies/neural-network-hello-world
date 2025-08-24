@@ -49,74 +49,64 @@ def main():
         print(f"Failed to create environment: {e}")
         return 1
     
+    def _first_layer_in_dim(sd: dict) -> int | None:
+        for k, v in sd.items():
+            if k.endswith("net.0.weight"):
+                return int(v.shape[1])  # [out, in]
+        return None
+
+    def _final_layer_out_dim(sd: dict) -> int | None:
+        for k, v in sd.items():
+            if k.endswith("net.2.weight"):
+                return int(v.shape[0])  # [n_act, hidden]
+        return None
+    
     # Load checkpoint
     try:
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)  # trusted local file
         
-        def _first_layer_in_dim(sd: dict) -> int | None:
-            for k, v in sd.items():
-                if k.endswith("net.0.weight"):
-                    return int(v.shape[1])  # [out, in]
-            return None
-        
-        def _final_layer_out_dim(sd: dict) -> int | None:
-            for k, v in sd.items():
-                if k.endswith("net.2.weight"):
-                    return int(v.shape[0])  # [n_act, hidden]
-            return None
-        
-        meta = ckpt.get("meta", {})
         sdg, sda = ckpt.get("pi_good", {}), ckpt.get("pi_adv", {})
-        sdg_in, sda_in = _first_layer_in_dim(sdg), _first_layer_in_dim(sda)
-        n_act = meta.get("n_act") or _final_layer_out_dim(sdg) or 5
+        good_in = _first_layer_in_dim(sdg)
+        adv_in  = _first_layer_in_dim(sda)
+        n_act   = ckpt.get("meta", {}).get("n_act") or _final_layer_out_dim(sdg) or 5
         
-        # Fallback to env if needed
-        if sdg_in is None or sda_in is None:
-            try:
-                obs0, _ = env.reset()
-            except Exception:
-                obs0 = env.reset()[0] if isinstance(env.reset(), tuple) else env.reset()
-            
-            keys = list(obs0.keys()) if isinstance(obs0, dict) else []
+        # Env fallback if any are None
+        if good_in is None or adv_in is None or n_act is None:
+            ob0, _ = env.reset() if isinstance(env.reset(), tuple) else (env.reset(), {})
+            keys = list(ob0.keys()) if isinstance(ob0, dict) else []
             gk = next((k for k in keys if "agent" in k), None)
             ak = next((k for k in keys if "adversary" in k), None)
-            if sdg_in is None and gk: sdg_in = int(env.observation_space(gk).shape[0])
-            if sda_in is None and ak: sda_in = int(env.observation_space(ak).shape[0])
+            if good_in is None and gk: good_in = int(env.observation_space(gk).shape[0])
+            if adv_in  is None and ak: adv_in  = int(env.observation_space(ak).shape[0])
             if n_act is None and (gk or ak):
-                anyk = gk or ak; n = getattr(env.action_space(anyk), "n", None); n_act = int(n or 5)
+                anyk = gk or ak
+                n = getattr(env.action_space(anyk), "n", None)
+                n_act = int(n or 5)
+        assert good_in and adv_in and n_act, "Failed to infer head dims"
         
-        # Preferred dims: good=10, adv=8 (per MPE). If ckpt is reversed, detect and swap.
-        good_in, adv_in = 10, 8
-        swap = False
-        if sdg_in in (8,10) and sda_in in (8,10):
-            if sdg_in == 8 and sda_in == 10:
-                swap = True
-            elif sdg_in == 10 and sda_in == 8:
-                swap = False
-            else:
-                # unexpected, but proceed with sd-inferred dims
-                good_in, adv_in = sdg_in, sda_in
-        
-        print(f"[eval heads] good_in={good_in} adv_in={adv_in} n_act={n_act} swap={swap}")
-        # Build heads
+        # Build heads to match the state_dicts
         pi_good = PolicyHead(good_in, n_act=n_act)
         vf_good = ValueHead(good_in)
-        pi_adv = PolicyHead(adv_in, n_act=n_act)
+        pi_adv  = PolicyHead(adv_in,  n_act=n_act)
         vf_adv = ValueHead(adv_in)
         
-        # Load with optional swap
-        if not swap:
+        try:
             pi_good.load_state_dict(sdg, strict=True)
             vf_good.load_state_dict(ckpt["vf_good"], strict=True)
             pi_adv.load_state_dict(sda, strict=True)
             vf_adv.load_state_dict(ckpt["vf_adv"], strict=True)
-        else:
-            print("[eval] ckpt heads appear reversed; swapping pi_good<->pi_adv for load")
+        except RuntimeError:
+            # Auto-swap if ckpt heads were saved reversed
+            pi_good = PolicyHead(adv_in, n_act=n_act)
+            vf_good = ValueHead(adv_in)
+            pi_adv  = PolicyHead(good_in, n_act=n_act)
+            vf_adv  = ValueHead(good_in)
             pi_good.load_state_dict(sda, strict=True)
             vf_good.load_state_dict(ckpt["vf_adv"], strict=True)
             pi_adv.load_state_dict(sdg, strict=True)
             vf_adv.load_state_dict(ckpt["vf_good"], strict=True)
         
+        print(f"[eval heads] good_in={good_in} adv_in={adv_in} n_act={n_act}")
         step = ckpt.get("step", 0)
         config = ckpt.get("config", {})
         
