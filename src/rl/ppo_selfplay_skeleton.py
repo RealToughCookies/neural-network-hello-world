@@ -736,17 +736,13 @@ def _save_rl_ckpt(path, step, pi_good, vf_good, pi_adv, vf_adv, opt, pool, confi
     if obs_dims:
         meta["obs_dims"] = obs_dims
     
-    torch.save({
-        "step": step,
-        "pi_good": pi_good.state_dict(),
-        "vf_good": vf_good.state_dict(),
-        "pi_adv": pi_adv.state_dict(),
-        "vf_adv": vf_adv.state_dict(),
-        "optimizer": opt.state_dict(),
-        "pool": [{"pi_good": s.pi_good, "pi_adv": s.pi_adv} for s in getattr(pool, "_items", [])],
-        "config": config,
-        "meta": meta,
-    }, path, _use_new_zipfile_serialization=False)
+    # Create MultiHeadPolicy for v2-roles format (random init, no transplant)
+    policy = MultiHeadPolicy(obs_dims, N_ACT)
+    # Start from random initialization - no legacy head transplant
+    
+    meta["schema"] = "v2-roles"
+    save_checkpoint(policy, meta, path)
+    print(f"[ckpt v2] wrote {path}")
 
 
 def _load_rl_ckpt_strict(path, adapter, allow_dim_adapter=False):
@@ -1054,47 +1050,21 @@ def selfplay_smoke_train(steps=1024):
         # Always save last checkpoint  
         last_path = save_dir_path / "last.pt"
         
-        # Save in both legacy and new format for compatibility
-        ckpt_payload = {
-            "step": current_step,
-            # Legacy format
-            "pi_good": pi_good.state_dict(),
-            "vf_good": vf_good.state_dict(),
-            "pi_adv": pi_adv.state_dict(),
-            "vf_adv": vf_adv.state_dict(),
-            # New role-aware format
-            "model": {
-                "pi.good": pi_good.state_dict(),
-                "vf.good": vf_good.state_dict(), 
-                "pi.adv": pi_adv.state_dict(),
-                "vf.adv": vf_adv.state_dict(),
-            },
-            "optimizer": optimizer.state_dict(),
-            "pool": [{"pi_good": s.pi_good, "pi_adv": s.pi_adv} for s in getattr(pool, "_items", [])],
-            "config": config,
-            "meta": {
-                "n_act": n_act,
-                "obs_dims": obs_dims,
-                "role_map": role_of
-            }
-        }
+        # Create MultiHeadPolicy for v2-roles format (random init, no transplant)
+        policy = MultiHeadPolicy(obs_dims, n_act)
+        # Start from random initialization - no legacy head transplant
         
-        # Flatten the model state dict for new format
-        model_state = {}
-        for role_key, state_dict in ckpt_payload["model"].items():
-            for param_key, param_value in state_dict.items():
-                model_state[f"{role_key}.{param_key}"] = param_value
-        ckpt_payload["model"] = model_state
-        _atomic_save(ckpt_payload, last_path)
-        print(f"[ckpt] wrote {last_path}")
+        meta = {"obs_dims": obs_dims, "schema": "v2-roles"}
+        save_checkpoint(policy, meta, last_path)
+        print(f"[ckpt v2] wrote {last_path}")
         
         # Check if this is the best model based on evaluation score
         current_score = eval_g + eval_a if 'eval_g' in locals() and 'eval_a' in locals() else 0.0
         if current_score > best_score:
             best_score = current_score
             best_path = save_dir_path / "best.pt"
-            _atomic_save(ckpt_payload, best_path)
-            print(f"[ckpt] updated {best_path} (score: {best_score:.3f})")
+            save_checkpoint(policy, meta, best_path)
+            print(f"[ckpt v2] wrote {best_path}")
     else:
         logs = []  # Empty logs for CSV
         update_idx = start_step  # Use start_step if no training occurred
@@ -1222,32 +1192,15 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0):
             if k.endswith("net.0.weight"): return int(v.shape[1])
         return None
     
-    ckpt = {
-        "step": 1,
-        "pi_good": policy.state_dict(),
-        "vf_good": value_fn.state_dict(),
-        "pi_adv": policy.state_dict(),  # Same policy for smoke test
-        "vf_adv": value_fn.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "pool": [],
-        "config": {"steps": steps, "env": env_kind, "seed": seed},
-        "meta": {
-            "n_act": N_ACT,
-            "obs_dims": obs_dims,
-            "role_map": {"adversary": "adv", "agent": "good"}
-        }
-    }
+    # Create MultiHeadPolicy for v2-roles format (random init, no transplant)
+    multi_policy = MultiHeadPolicy(obs_dims, N_ACT)
+    # Start from random initialization - no legacy head transplant
     
-    # Optional: assert shapes before save
-    def _assert_in_dims(sd, want):
-        got = _first_layer_in_dim(sd)
-        assert got == want, f"unexpected in_dim {got}, expected {want}"
-    _assert_in_dims(policy.state_dict(), 10)  # smoke test uses same policy
-    
-    _atomic_save(ckpt, last_path)
-    print(f"[ckpt] wrote {last_path}")
-    _atomic_save(ckpt, best_path)
-    print(f"[ckpt] wrote {best_path}")
+    meta = {"obs_dims": obs_dims, "schema": "v2-roles"}
+    save_checkpoint(multi_policy, meta, last_path)
+    print(f"[ckpt v2] wrote {last_path}")
+    save_checkpoint(multi_policy, meta, best_path)
+    print(f"[ckpt v2] wrote {best_path}")
     
     # Relaxed success criteria: allow reasonable KL drift and finite losses
     _ensure_artifacts()
@@ -1613,31 +1566,13 @@ def main():
                 if k.endswith("net.0.weight"): return int(v.shape[1])
             return None
         
-        ckpt = {
-            "step": int(update_idx + 1),
-            "pi_good": pi_good.state_dict(),
-            "vf_good": vf_good.state_dict(), 
-            "pi_adv": pi_adv.state_dict(),
-            "vf_adv": vf_adv.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "pool": [{"pi_good": s.pi_good, "pi_adv": s.pi_adv} for s in getattr(pool, "_items", [])],
-            "config": vars(args),
-            "meta": {
-                "n_act": n_act,
-                "obs_dims": obs_dims,
-                "role_map": role_of
-            }
-        }
+        # Create MultiHeadPolicy for v2-roles format (random init, no transplant)
+        policy = MultiHeadPolicy(obs_dims, n_act)
+        # Start from random initialization - no legacy head transplant
         
-        # Optional: assert shapes before save
-        def _assert_in_dims(sd, want):
-            got = _first_layer_in_dim(sd)
-            assert got == want, f"unexpected in_dim {got}, expected {want}"
-        _assert_in_dims(pi_good.state_dict(), 10)
-        _assert_in_dims(pi_adv.state_dict(), 8)
-        
-        _atomic_save(ckpt, last_path)
-        print(f"[ckpt] wrote {last_path}")
+        meta = {"obs_dims": obs_dims, "schema": "v2-roles"}
+        save_checkpoint(policy, meta, last_path)
+        print(f"[ckpt v2] wrote {last_path}")
         
         # Add checkpoint to opponent pool
         pool.add(last_path, int(update_idx + 1))
@@ -1646,8 +1581,8 @@ def main():
         score = float(eval_g) + float(eval_a)
         if score > best_score:
             best_score = score
-            _atomic_save(ckpt, best_path)
-            print(f"[ckpt] updated {best_path} (score: {score:.3f})")
+            save_checkpoint(policy, meta, best_path)
+            print(f"[ckpt v2] wrote {best_path}")
             # Also add best checkpoint to pool
             pool.add(best_path, int(update_idx + 1))
     
