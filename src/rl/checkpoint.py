@@ -50,11 +50,25 @@ def _normalize_ckpt_obj(ck: Any) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any
     raise ValueError("Unsupported checkpoint format")
 
 # ---------- main API ----------
+def _has_role_keys(sd: Dict[str, torch.Tensor]) -> bool:
+    ks = sd.keys()
+    return (any(k.startswith("pi.good.") for k in ks) and
+            any(k.startswith("pi.adv.")  for k in ks) and
+            any(k.startswith("vf.good.") for k in ks) and
+            any(k.startswith("vf.adv.")  for k in ks))
+
 def save_checkpoint(model, meta: Dict[str, Any], path: str | Path) -> None:
-    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
-    obj = {"model": model.state_dict(), "meta": meta}
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sd = model.state_dict()
+    if not _has_role_keys(sd):
+        sample = [k for k in sd.keys()][:16]
+        raise RuntimeError(f"[save] state_dict missing role-labeled keys; "
+                           f"expected pi.good/adv.* and vf.good/adv.*; sample={sample}")
+    obj = {"model": sd, "meta": meta}
     tmp = path.with_suffix(path.suffix + ".tmp")
-    torch.save(obj, tmp); tmp.replace(path)
+    torch.save(obj, tmp)
+    tmp.replace(path)
 
 def load_policy_role_scoped(model, full_sd: Dict[str, torch.Tensor], expect_dims: Dict[str,int], roles=("good","adv")) -> None:
     """

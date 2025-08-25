@@ -23,40 +23,19 @@ class DimAdapter(nn.Module):
 
 
 class MultiHeadPolicy(nn.Module):
-    """
-    Multi-head policy network with separate heads for different agent roles.
-    Each role gets its own input layer to handle different observation dimensions.
-    Uses role-keyed ModuleDicts for safe checkpoint loading.
-    """
-    
-    def __init__(self, obs_dims: Dict[str, int], n_actions: int = 5):
+    def __init__(self, obs_dims: Dict[str, int], n_actions: int):
         super().__init__()
-        self.obs_dims = obs_dims
-        self.n_actions = n_actions
-        
-        # Create role-keyed ModuleDict for policy heads
-        self.pi = nn.ModuleDict()
-        self.vf = nn.ModuleDict()
-        
-        for role, obs_dim in obs_dims.items():
-            self.pi[role] = PolicyHead(obs_dim, n_actions)
-            self.vf[role] = ValueHead(obs_dim)
-    
-    def act(self, role: str, obs: torch.Tensor) -> torch.Tensor:
-        """Get policy logits for specific role."""
-        if role not in self.pi:
-            raise ValueError(f"Unknown role: {role}. Available: {list(self.pi.keys())}")
-        return self.pi[role](obs)
-    
-    def value(self, role: str, obs: torch.Tensor) -> torch.Tensor:
-        """Get value estimate for specific role."""
-        if role not in self.vf:
-            raise ValueError(f"Unknown role: {role}. Available: {list(self.vf.keys())}")
-        return self.vf[role](obs)
-    
-    def forward(self, role: str, obs: torch.Tensor) -> torch.Tensor:
-        """Forward pass for specific role (backward compatibility)."""
-        return self.act(role, obs)
+        # IMPORTANT: role-named ModuleDicts
+        self.pi = nn.ModuleDict({
+            "good": PolicyHead(obs_dims["good"], n_actions),
+            "adv":  PolicyHead(obs_dims["adv"],  n_actions),
+        })
+        self.vf = nn.ModuleDict({
+            "good": ValueHead(obs_dims["good"]),
+            "adv":  ValueHead(obs_dims["adv"]),
+        })
+    def act(self, role: str, x):   return self.pi[role](x)
+    def value(self, role: str, x): return self.vf[role](x)
 
 
 class MultiHeadValue(nn.Module):
@@ -106,34 +85,22 @@ class MultiHeadValue(nn.Module):
 
 
 class PolicyHead(nn.Module):
-    """
-    Legacy single-role policy head for backwards compatibility.
-    """
-    
-    def __init__(self, in_dim: int, n_act: int = 5):
+    def __init__(self, in_dim: int, n_actions: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, 64),
-            nn.Tanh(),
-            nn.Linear(64, n_act)
+            nn.Linear(in_dim, 64), nn.Tanh(),
+            nn.Linear(64, 64), nn.Tanh(),
+            nn.Linear(64, n_actions),
         )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+    def forward(self, x): return self.net(x)
 
 
 class ValueHead(nn.Module):
-    """
-    Legacy single-role value head for backwards compatibility.
-    """
-    
     def __init__(self, in_dim: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, 64),
-            nn.Tanh(),
-            nn.Linear(64, 1)
+            nn.Linear(in_dim, 64), nn.Tanh(),
+            nn.Linear(64, 64), nn.Tanh(),
+            nn.Linear(64, 1),
         )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).squeeze(-1)
+    def forward(self, x): return self.net(x).squeeze(-1)
