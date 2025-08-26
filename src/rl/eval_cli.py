@@ -13,25 +13,82 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from src.rl.ppo_selfplay_skeleton import PolicyHead, ValueHead, N_ACT
-from src.rl.selfplay import evaluate
 from src.rl.env_api import make_adapter
 from src.rl.models import MultiHeadPolicy, DimAdapter
 from src.rl.checkpoint import load_policy_from_ckpt, load_legacy_checkpoint
 import src.rl.adapters  # Import to register adapters
 
 
+def run_episodes(policy, adapter, agents, roles, episodes: int, seed: int, deterministic: bool = True, adapters=None):
+    """Run episodes using adapter API and return win rate for learner (good) side."""
+    import numpy as np
+    import torch
+    
+    wins = 0
+    total = 0
+    for ep in range(episodes):
+        ts = adapter.reset(seed=seed + ep)
+        done = False
+        # track per-role returns if you need win/loss by comparing sums
+        rets = {a: 0.0 for a in agents}
+        while not all(ts.dones.values()):
+            actions = {}
+            for agent in agents:
+                role = roles[agent]
+                obs_np = ts.obs[agent]
+                obs = torch.tensor(obs_np, dtype=torch.float32).unsqueeze(0)
+                
+                # Apply dimension adapter if needed
+                if adapters and role in adapters:
+                    obs = adapters[role](obs)
+                
+                with torch.no_grad():
+                    logits = policy.act(role, obs)
+                if deterministic:
+                    a = int(torch.argmax(logits, dim=-1).item())
+                else:
+                    probs = torch.softmax(logits, dim=-1)
+                    a = int(torch.distributions.Categorical(probs=probs).sample().item())
+                actions[agent] = a
+            ts = adapter.step(actions)
+            for a in agents:
+                rets[a] += float(ts.rewards[a])
+        # decide win/loss for the learner side (assume learner plays "good" unless you toggle)
+        good_agents = [a for a in agents if roles[a] == "good"]
+        adv_agents = [a for a in agents if roles[a] == "adv"]
+        good_total = sum(rets[a] for a in good_agents) if good_agents else 0.0
+        adv_total = sum(rets[a] for a in adv_agents) if adv_agents else 0.0
+        if good_total > adv_total:
+            wins += 1
+        total += 1
+    return wins / max(1, total)
+
+
 def main():
     print(f"[cwd] {os.getcwd()}")
     
     parser = argparse.ArgumentParser(description='Evaluate RL checkpoint')
-    parser.add_argument('--ckpt', required=True, help='Path to checkpoint file')
+    parser.add_argument('--ckpt', help='Path to checkpoint file')
     parser.add_argument('--episodes', type=int, default=100, help='Number of evaluation episodes')
-    parser.add_argument('--env', default='mpe_adversary', help='Environment to use')
+    parser.add_argument("--env", type=str, default="mpe_adversary",
+                        help="Environment adapter name (e.g., mpe_adversary, dota_last_hit)")
+    parser.add_argument("--list-envs", action="store_true",
+                        help="List available env adapters and exit")
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
     parser.add_argument('--pool', default='artifacts/rl_opponents.json', help='Opponent pool JSON file')
     parser.add_argument('--allow-dim-adapter', action='store_true', default=False,
                        help='Allow dimension adapter for obs dim mismatches')
     args = parser.parse_args()
+    
+    # Handle list-envs option
+    from src.rl.env_api import make_adapter, _REGISTRY
+    if getattr(args, "list_envs", False):
+        print("Available adapters:", ", ".join(sorted(_REGISTRY.keys())))
+        raise SystemExit(0)
+    
+    # Validate required arguments
+    if not args.ckpt:
+        parser.error("the following arguments are required: --ckpt")
     
     # Resolve checkpoint path
     ckpt_path = Path(args.ckpt).expanduser().resolve(strict=False)
@@ -55,11 +112,19 @@ def main():
         print(f"Created environment: {args.env}")
         
         # Get role mapping and observation dimensions from adapter
-        role_of = adapter.roles()
+        roles = adapter.roles()
         obs_dims = adapter.obs_dims()
-        print(f"[roles] {role_of}")
+        n_actions = adapter.n_actions()
+        agents = adapter.agent_names()
+        print(f"[roles] {roles}")
         print(f"[obs_dims] {obs_dims}")
+        print(f"[n_actions] {n_actions}")
+        print(f"[agents] {agents}")
         
+    except ValueError as e:
+        print(e)
+        print("Tip: run with --list-envs to see registered adapters.")
+        return 2
     except Exception as e:
         print(f"Failed to create environment: {e}")
         return 1
@@ -98,15 +163,14 @@ def main():
             if not args.allow_dim_adapter:
                 raise ValueError(
                     f"Dimension mismatch: ckpt={saved_dims}, env={env_dims}. "
-                    "Pin pettingzoo<1.25 or run with --allow-dim-adapter to insert a Linear adapter."
+                    "Run with --allow-dim-adapter to insert a Linear adapter for dimension mismatch."
                 )
             else:
                 print(f"WARNING: Using dimension adapters for mismatch between ckpt and env dims")
         
-        n_act = ckpt.get("meta", {}).get("n_act") or N_ACT
-        
+        # Use n_actions from adapter or fallback to checkpoint metadata  
         # Build MultiHeadPolicy using checkpoint dimensions
-        policy = MultiHeadPolicy(saved_dims, n_act)
+        policy = MultiHeadPolicy(saved_dims, n_actions)
         
         print(f"[checkpoint obs_dims] good={saved_dims['good']}, adv={saved_dims['adv']}")
         print(f"[model expects] good={saved_dims['good']}, adv={saved_dims['adv']}")
@@ -141,7 +205,7 @@ def main():
                     print(f"WARNING: Added adapter for role '{role}': env_dim={env_dim} -> ckpt_dim={ckpt_dim}")
         
         # Print final dimensions the network expects
-        print(f"Network expects per-role dims: good={saved_dims['good']}, adv={saved_dims['adv']}, n_act={n_act}")
+        print(f"Network expects per-role dims: good={saved_dims['good']}, adv={saved_dims['adv']}, n_actions={n_actions}")
         step = ckpt.get("step", 0)
         config = ckpt.get("config", {})
         
@@ -153,20 +217,8 @@ def main():
         print(f"Failed to load checkpoint: {e}")
         return 1
     
-    # Set networks to evaluation mode and extract policy/value heads
-    if 'policy' in locals():
-        # New format - use MultiHeadPolicy
-        policy.eval()
-        pi_good = policy.pi["good"]
-        pi_adv = policy.pi["adv"] 
-        vf_good = policy.vf["good"]
-        vf_adv = policy.vf["adv"]
-    else:
-        # Legacy format - individual heads
-        pi_good.eval()
-        vf_good.eval() 
-        pi_adv.eval()
-        vf_adv.eval()
+    # Set networks to evaluation mode
+    policy.eval()
     
     # Create seeded RNG for evaluation
     import numpy as np
@@ -184,9 +236,8 @@ def main():
         
         # 1. Self-play (mirror match)
         print("1/4: Self vs self mirror...")
-        mean_good_self, mean_adv_self = evaluate(adapter.env, pi_good, pi_adv, episodes=args.episodes // 4)
-        results['wr_self'] = 0.5  # Always 50% in self-play
-        print(f"   Self-play: good={mean_good_self:.3f}, adv={mean_adv_self:.3f}")
+        results['wr_self'] = run_episodes(policy, adapter, agents, roles, episodes=args.episodes // 4, seed=args.seed, adapters=adapters)
+        print(f"   Self-play win rate: {results['wr_self']:.3f}")
         
         # 2. vs best.pt if exists
         best_path = ckpt_path.parent / "best.pt"
@@ -194,15 +245,23 @@ def main():
             print("2/4: vs best.pt...")
             try:
                 best_ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
-                opp_policy = MultiHeadPolicy(saved_dims, n_act)
+                opp_policy = MultiHeadPolicy(saved_dims, n_actions)
                 load_policy_from_ckpt(opp_policy, best_ckpt, expect_dims=saved_dims)
-                opp_pi_good = opp_policy.pi["good"]
-                opp_pi_adv = opp_policy.pi["adv"]
                 
-                # Evaluate with opponent as good agents, learner as adversary
-                _, mean_learner_vs_best = evaluate(adapter.env, opp_pi_good, pi_adv, episodes=args.episodes // 4)
-                results['wr_best'] = 1.0 if mean_learner_vs_best > 0 else 0.0  # Win if positive reward
-                print(f"   vs best.pt: learner_reward={mean_learner_vs_best:.3f}")
+                # Temporarily load opponent weights into good role, keep learner as adversary
+                original_good_state = policy.pi["good"].state_dict().copy()
+                original_good_vf_state = policy.vf["good"].state_dict().copy()
+                policy.pi["good"].load_state_dict(opp_policy.pi["good"].state_dict())
+                policy.vf["good"].load_state_dict(opp_policy.vf["good"].state_dict())
+                
+                # Run evaluation (win rate from good perspective, so 1-wr = learner adv win rate)
+                wr = run_episodes(policy, adapter, agents, roles, episodes=args.episodes // 4, seed=args.seed + 1000, adapters=adapters)
+                results['wr_best'] = 1.0 - wr  # Learner (adv) wins when good loses
+                print(f"   vs best.pt: learner_wr={results['wr_best']:.3f}")
+                
+                # Restore original weights
+                policy.pi["good"].load_state_dict(original_good_state)
+                policy.vf["good"].load_state_dict(original_good_vf_state)
             except Exception as e:
                 print(f"   vs best.pt failed: {e}")
                 results['wr_best'] = 0.5
@@ -222,16 +281,25 @@ def main():
                 if opponent_ckpt and Path(opponent_ckpt).exists():
                     try:
                         opp_ckpt = torch.load(opponent_ckpt, map_location="cpu", weights_only=False)
-                        opp_policy = MultiHeadPolicy(saved_dims, n_act)
+                        opp_policy = MultiHeadPolicy(saved_dims, n_actions)
                         load_policy_from_ckpt(opp_policy, opp_ckpt, expect_dims=saved_dims)
-                        opp_pi_good = opp_policy.pi["good"]
-                        opp_pi_adv = opp_policy.pi["adv"]
                         
-                        _, learner_reward = evaluate(adapter.env, opp_pi_good, pi_adv, episodes=episodes_per_opponent)
-                        if learner_reward > 0:
+                        # Temporarily load opponent weights into good role  
+                        original_good_state = policy.pi["good"].state_dict().copy()
+                        original_good_vf_state = policy.vf["good"].state_dict().copy()
+                        policy.pi["good"].load_state_dict(opp_policy.pi["good"].state_dict())
+                        policy.vf["good"].load_state_dict(opp_policy.vf["good"].state_dict())
+                        
+                        wr = run_episodes(policy, adapter, agents, roles, episodes=episodes_per_opponent, seed=args.seed + i + 2000, adapters=adapters)
+                        learner_wr = 1.0 - wr  # Learner (adv) wins when good loses
+                        if learner_wr > 0.5:
                             uniform_wins += 1
                         uniform_games += 1
-                        print(f"   vs {Path(opponent_ckpt).name}: reward={learner_reward:.3f}")
+                        print(f"   vs {Path(opponent_ckpt).name}: learner_wr={learner_wr:.3f}")
+                        
+                        # Restore original weights
+                        policy.pi["good"].load_state_dict(original_good_state)
+                        policy.vf["good"].load_state_dict(original_good_vf_state)
                     except Exception as e:
                         print(f"   vs {opponent_ckpt}: failed ({e})")
             
@@ -252,16 +320,25 @@ def main():
                 if opponent_ckpt and Path(opponent_ckpt).exists():
                     try:
                         opp_ckpt = torch.load(opponent_ckpt, map_location="cpu", weights_only=False)
-                        opp_policy = MultiHeadPolicy(saved_dims, n_act)
+                        opp_policy = MultiHeadPolicy(saved_dims, n_actions)
                         load_policy_from_ckpt(opp_policy, opp_ckpt, expect_dims=saved_dims)
-                        opp_pi_good = opp_policy.pi["good"]
-                        opp_pi_adv = opp_policy.pi["adv"]
                         
-                        _, learner_reward = evaluate(adapter.env, opp_pi_good, pi_adv, episodes=episodes_per_opponent)
-                        if learner_reward > 0:
+                        # Temporarily load opponent weights into good role  
+                        original_good_state = policy.pi["good"].state_dict().copy()
+                        original_good_vf_state = policy.vf["good"].state_dict().copy()
+                        policy.pi["good"].load_state_dict(opp_policy.pi["good"].state_dict())
+                        policy.vf["good"].load_state_dict(opp_policy.vf["good"].state_dict())
+                        
+                        wr = run_episodes(policy, adapter, agents, roles, episodes=episodes_per_opponent, seed=args.seed + i + 3000, adapters=adapters)
+                        learner_wr = 1.0 - wr  # Learner (adv) wins when good loses
+                        if learner_wr > 0.5:
                             prioritized_wins += 1
                         prioritized_games += 1
-                        print(f"   vs {Path(opponent_ckpt).name}: reward={learner_reward:.3f}")
+                        print(f"   vs {Path(opponent_ckpt).name}: learner_wr={learner_wr:.3f}")
+                        
+                        # Restore original weights
+                        policy.pi["good"].load_state_dict(original_good_state)
+                        policy.vf["good"].load_state_dict(original_good_vf_state)
                     except Exception as e:
                         print(f"   vs {opponent_ckpt}: failed ({e})")
             
