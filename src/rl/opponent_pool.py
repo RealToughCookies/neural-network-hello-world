@@ -1,268 +1,124 @@
-"""
-Prioritized opponent pool with JSON persistence for RL training.
-"""
-import json
-import math
-import numpy as np
+from __future__ import annotations
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional, Tuple
+import json, time, hashlib, math, os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
-import logging
 
-logger = logging.getLogger(__name__)
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
+def _hash_path(p: str) -> str:
+    return hashlib.sha1(p.encode()).hexdigest()[:10]
+
+@dataclass
+class OppEntry:
+    id: str
+    ckpt_path: str
+    role: str
+    step: int
+    elo: float = 1000.0
+    games: int = 0
+    wins: int = 0
+    losses: int = 0
+    ema_exploit: float = 0.0
+    added: str = ""
 
 class OpponentPool:
-    """
-    Manages a pool of opponent checkpoints with EMA win rates and prioritized sampling.
-    
-    Persists state to JSON file with structure per opponent:
-    {
-        "ckpt": "artifacts/rl_ckpts/step_XXXX.pt",
-        "wins": int,
-        "games": int, 
-        "ema_wr": float,
-        "last_seen_step": int
-    }
-    """
-    
-    def __init__(self, path: Union[str, Path], max_size: int = 64, 
-                 ema_decay: float = 0.97, min_games: int = 5):
-        """
-        Initialize opponent pool.
-        
-        Args:
-            path: JSON file path for persistence
-            max_size: Maximum number of opponents to keep
-            ema_decay: EMA decay factor for win rate (higher = more history)
-            min_games: Minimum games before using EMA win rate for sampling
-        """
-        self.path = Path(path)
-        self.max_size = max_size
-        self.ema_decay = ema_decay
-        self.min_games = min_games
-        self.opponents: Dict[str, Dict] = {}
-        
-        # Create directory if needed
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Load existing pool
-        self._load()
-    
-    def _load(self) -> None:
-        """Load opponents from JSON file."""
-        if self.path.exists():
-            try:
-                with open(self.path, 'r') as f:
-                    data = json.load(f)
-                    self.opponents = data.get('opponents', {})
-                logger.info(f"Loaded {len(self.opponents)} opponents from {self.path}")
-            except (json.JSONDecodeError, IOError) as e:
-                logger.warning(f"Failed to load opponent pool from {self.path}: {e}")
-                self.opponents = {}
-        else:
-            logger.info(f"Creating new opponent pool at {self.path}")
-            self.opponents = {}
-    
-    def _save(self) -> None:
-        """Save opponents to JSON file."""
-        try:
-            data = {'opponents': self.opponents}
-            with open(self.path, 'w') as f:
-                json.dump(data, f, indent=2)
-            logger.debug(f"Saved {len(self.opponents)} opponents to {self.path}")
-        except IOError as e:
-            logger.error(f"Failed to save opponent pool to {self.path}: {e}")
-    
-    def add(self, ckpt_path: Union[str, Path], step: int) -> None:
-        """
-        Add or refresh an opponent checkpoint.
-        
-        Args:
-            ckpt_path: Path to checkpoint file
-            step: Training step when checkpoint was created
-        """
-        ckpt_str = str(Path(ckpt_path).resolve())
-        
-        if ckpt_str in self.opponents:
-            # Update existing opponent
-            self.opponents[ckpt_str]['last_seen_step'] = step
-            logger.debug(f"Updated opponent {ckpt_str} last_seen_step to {step}")
-        else:
-            # Add new opponent
-            self.opponents[ckpt_str] = {
-                'ckpt': ckpt_str,
-                'wins': 0,
-                'games': 0,
-                'ema_wr': 0.5,  # Start at neutral
-                'last_seen_step': step
-            }
-            logger.info(f"Added new opponent {ckpt_str} at step {step}")
-        
-        # Prune if needed
-        if len(self.opponents) > self.max_size:
-            self.prune(self.max_size)
-        
-        self._save()
-    
-    def record_result(self, ckpt_path: Union[str, Path], won: bool) -> None:
-        """
-        Record game result against an opponent.
-        
-        Args:
-            ckpt_path: Path to opponent checkpoint
-            won: True if we won, False if we lost
-        """
-        ckpt_str = str(Path(ckpt_path).resolve())
-        
-        if ckpt_str not in self.opponents:
-            logger.warning(f"Recording result for unknown opponent {ckpt_str}")
-            return
-        
-        opp = self.opponents[ckpt_str]
-        opp['games'] += 1
-        if won:
-            opp['wins'] += 1
-        
-        # Update EMA win rate
-        win_rate = 1.0 if won else 0.0
-        opp['ema_wr'] = self.ema_decay * opp['ema_wr'] + (1 - self.ema_decay) * win_rate
-        
-        logger.debug(f"Recorded {'win' if won else 'loss'} vs {ckpt_str}: "
-                    f"{opp['wins']}/{opp['games']} games, ema_wr={opp['ema_wr']:.3f}")
-        
-        # Save after every result to avoid data loss
-        self._save()
-    
-    def decay_all(self, decay_factor: float = 0.99) -> None:
-        """
-        Apply slight decay of all EMA win rates toward 0.5 to prevent lock-in.
-        
-        Args:
-            decay_factor: How much to decay toward neutral (0.5)
-        """
-        for opp in self.opponents.values():
-            # Decay toward 0.5
-            opp['ema_wr'] = decay_factor * opp['ema_wr'] + (1 - decay_factor) * 0.5
-        
-        if self.opponents:
-            logger.debug(f"Applied decay to {len(self.opponents)} opponents")
-            self._save()
-    
-    def sample_uniform(self, rng: np.random.Generator) -> Optional[str]:
-        """
-        Sample opponent uniformly at random.
-        
-        Args:
-            rng: Numpy random generator
-            
-        Returns:
-            Checkpoint path of selected opponent, or None if pool empty
-        """
-        if not self.opponents:
-            return None
-        
-        ckpt_paths = list(self.opponents.keys())
-        idx = rng.integers(0, len(ckpt_paths))
-        return ckpt_paths[idx]
-    
-    def sample_prioritized(self, rng: np.random.Generator, temp: float = 0.7) -> Optional[str]:
-        """
-        Sample opponent using prioritized sampling based on win rate.
-        
-        Args:
-            rng: Numpy random generator
-            temp: Temperature for softmax (lower = more focused on difficult opponents)
-            
-        Returns:
-            Checkpoint path of selected opponent, or None if pool empty
-        """
-        if not self.opponents:
-            return None
-        
-        ckpt_paths = list(self.opponents.keys())
-        logits = []
-        
-        for ckpt_path in ckpt_paths:
-            opp = self.opponents[ckpt_path]
-            
-            # Use EMA win rate if enough games, otherwise neutral
-            if opp['games'] >= self.min_games:
-                score = np.clip(opp['ema_wr'], 0.05, 0.95)
-            else:
-                score = 0.5
-            
-            # Convert to logit: log(p / (1-p)) / temp
-            logit = math.log(score / (1 - score)) / temp
-            logits.append(logit)
-        
-        # Softmax to get probabilities
-        logits = np.array(logits)
-        exp_logits = np.exp(logits - np.max(logits))  # Numerical stability
-        probs = exp_logits / np.sum(exp_logits)
-        
-        # Sample
-        idx = rng.choice(len(ckpt_paths), p=probs)
-        selected = ckpt_paths[idx]
-        
-        logger.debug(f"Prioritized sample: {selected} (ema_wr={self.opponents[selected]['ema_wr']:.3f})")
-        return selected
-    
-    def prune(self, max_size: int) -> None:
-        """
-        Prune pool to max_size, keeping most recent and diverse opponents.
-        
-        Sort by:
-        1. last_seen_step (desc) - keep recent
-        2. |ema_wr - 0.5| (asc) - keep diverse difficulties
-        
-        Args:
-            max_size: Maximum opponents to keep
-        """
-        if len(self.opponents) <= max_size:
-            return
-        
-        # Sort opponents for pruning
-        items = list(self.opponents.items())
-        
-        def sort_key(item):
-            ckpt_path, opp = item
-            recency = -opp['last_seen_step']  # Negative for desc sort
-            difficulty_diversity = abs(opp['ema_wr'] - 0.5)  # Closer to 0.5 = more diverse
-            return (recency, difficulty_diversity)
-        
-        items.sort(key=sort_key)
-        
-        # Keep top max_size opponents
-        kept_items = items[:max_size]
-        pruned_count = len(items) - max_size
-        
-        self.opponents = dict(kept_items)
-        
-        logger.info(f"Pruned {pruned_count} opponents, kept {len(self.opponents)}")
-        self._save()
-    
-    def get_stats(self) -> Dict:
-        """Get pool statistics."""
-        if not self.opponents:
-            return {'size': 0}
-        
-        ema_wrs = [opp['ema_wr'] for opp in self.opponents.values()]
-        games = [opp['games'] for opp in self.opponents.values()]
-        
-        return {
-            'size': len(self.opponents),
-            'avg_ema_wr': np.mean(ema_wrs),
-            'std_ema_wr': np.std(ema_wrs),
-            'min_ema_wr': np.min(ema_wrs),
-            'max_ema_wr': np.max(ema_wrs),
-            'total_games': np.sum(games),
-            'avg_games': np.mean(games)
+    def __init__(self, env: str, obs_dims: Dict[str,int], schema: str = "v1-elo-pool"):
+        self.schema = schema
+        self.env = env
+        self.obs_dims = dict(obs_dims)
+        self.created = _now_iso()
+        self.entries: Dict[str, OppEntry] = {}
+
+    # ---------- I/O ----------
+    @classmethod
+    def load(cls, path: str) -> "OpponentPool":
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(path)
+        obj = json.loads(p.read_text())
+        assert obj.get("schema") == "v1-elo-pool", "Unsupported pool schema"
+        pool = cls(env=obj["env"], obs_dims=obj["obs_dims"], schema=obj["schema"])
+        pool.created = obj.get("created") or pool.created
+        for e in obj.get("entries", []):
+            oe = OppEntry(**e)
+            pool.entries[oe.id] = oe
+        return pool
+
+    def save(self, path: str) -> None:
+        p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
+        obj = {
+            "schema": self.schema,
+            "env": self.env,
+            "obs_dims": self.obs_dims,
+            "created": self.created,
+            "entries": [asdict(e) for e in self.entries.values()]
         }
-    
-    def __len__(self) -> int:
-        """Return number of opponents in pool."""
-        return len(self.opponents)
-    
-    def __bool__(self) -> bool:
-        """Return True if pool is non-empty."""
-        return len(self.opponents) > 0
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(obj, indent=2))
+        tmp.replace(p)
+
+    # ---------- core ----------
+    def add_entry(self, ckpt_path: str, role: str, step: int, init_elo: float = 1000.0) -> str:
+        eid = f"{Path(ckpt_path).name}@step={step}#{_hash_path(ckpt_path)}"
+        if eid in self.entries: return eid
+        self.entries[eid] = OppEntry(
+            id=eid, ckpt_path=ckpt_path, role=role, step=step,
+            elo=init_elo, games=0, wins=0, losses=0, ema_exploit=0.0, added=_now_iso()
+        )
+        return eid
+
+    def list_by_elo(self) -> List[OppEntry]:
+        return sorted(self.entries.values(), key=lambda e: e.elo, reverse=True)
+
+    def prune(self, max_entries: int = 64):
+        items = self.list_by_elo()
+        for e in items[max_entries:]:
+            self.entries.pop(e.id, None)
+
+    def sample(self, n: int, temp: float = 0.7, min_games: int = 5,
+               min_selfplay_frac: float = 0.10, selfplay_role: str = "good") -> List[Tuple[str, OppEntry]]:
+        """
+        Return (kind, entry) where kind in {"self","pool"}; ensure >= selfplay_frac.
+        """
+        out: List[Tuple[str, OppEntry]] = []
+        num_self = max(0, int(round(n * min_selfplay_frac)))
+        # self-play slots
+        for _ in range(num_self): out.append(("self", None))
+        # pool slots
+        pool = [e for e in self.entries.values() if e.games >= min_games]
+        if not pool:
+            out.extend([("self", None)] * (n - len(out)))
+            return out[:n]
+        # softmax over elo (higher elo → more probable), temperature temp
+        elos = [e.elo for e in pool]
+        m = max(elos)
+        logits = [ (x - m) / max(1e-6, temp) for x in elos ]
+        ws = [ math.exp(z) for z in logits ]
+        s = sum(ws)
+        ps = [ w/s for w in ws ]
+        import random
+        for _ in range(n - len(out)):
+            e = random.choices(pool, weights=ps, k=1)[0]
+            out.append(("pool", e))
+        return out
+
+    def record_result(self, opp_id: str, learner_win: bool, ema_decay: float = 0.97, K: float = 16.0):
+        e = self.entries.get(opp_id)
+        if e is None: 
+            return
+        # learner vs opponent model rating; we only update opponent's Elo (learner is on-line)
+        # estimate learner rating as the mean of top opponents (or 1000 if unknown)
+        top = self.list_by_elo()[:5]
+        learner_elo = sum([x.elo for x in top]) / max(1, len(top)) if top else 1000.0
+        expected_opp = 1.0 / (1.0 + 10 ** ((learner_elo - e.elo) / 400.0))
+        result_for_opp = 0.0 if learner_win else 1.0
+        # K factor anneal with games
+        K_eff = K / math.sqrt(max(1.0, e.games + 1))
+        e.elo = float(e.elo + K_eff * (result_for_opp - expected_opp))
+        e.games += 1
+        if learner_win: e.losses += 1
+        else: e.wins += 1
+        # exploitability: higher when learner beats it
+        e.ema_exploit = float(ema_decay * e.ema_exploit + (1 - ema_decay) * (1.0 if learner_win else 0.0))

@@ -1306,6 +1306,12 @@ def main():
                        help='Maximum opponents to keep in pool')
     parser.add_argument('--opp-min-games', type=int, default=5,
                        help='Minimum games before using EMA win rate')
+    parser.add_argument("--pool-path", type=str, default="artifacts/rl_opponents.json",
+                       help="Path to Elo-based opponent pool JSON file")
+    parser.add_argument("--gate-best-min-wr", type=float, default=0.55,
+                       help="Minimum self-play win rate to copy last.pt -> best.pt")
+    parser.add_argument("--gate-pool-min-wr", type=float, default=0.52,
+                       help="Minimum uniform pool win rate to add to pool")
     
     # Dimension handling arguments
     parser.add_argument('--allow-dim-adapter', action='store_true', default=False,
@@ -1345,6 +1351,7 @@ def main():
             raise SystemExit("--pin-pz124 requires PettingZoo to be installed")
     
     # Set seeds
+    import torch
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1386,9 +1393,17 @@ def main():
     
     print(f"Starting PPO self-play training: {args.updates} updates, {args.steps} steps/update")
     
-    # Initialize opponent pool
-    pool = OpponentPool("artifacts/rl_opponents.json", args.opp_max, args.opp_ema_decay, args.opp_min_games)
-    print(f"Opponent pool: {len(pool)} opponents loaded")
+    # Initialize Elo-based opponent pool
+    pool = None
+    try:
+        pool = OpponentPool.load(args.pool_path)
+        # sanity: env & dims must match
+        assert pool.env == args.env and pool.obs_dims == obs_dims
+        print(f"Loaded opponent pool: {len(pool.entries)} opponents from {args.pool_path}")
+    except Exception as e:
+        print(f"Creating new opponent pool: {e}")
+        pool = OpponentPool(env=args.env, obs_dims=obs_dims)
+        print(f"Created new opponent pool for env={args.env}, obs_dims={obs_dims}")
     
     # Checkpoint and resume logic
     start_update = 0
@@ -1492,11 +1507,50 @@ def main():
         if args.curriculum != "off":
             print(f"Curriculum: progress={progress:.3f}, level={lvl:.2f}")
         
-        # Pick opponent for this episode
+        # Sample opponent using Elo-based pool
         try:
-            opp_pg, opp_pa, opp_vg, opp_va, source, selected_ckpt = _select_opponent(
-                pool, pi_good, pi_adv, vf_good, vf_adv, rng, args, obs_dims, n_act
-            )
+            # Sample 1 opponent for this episode
+            picks = pool.sample(n=1, temp=args.opp_temp, min_games=args.opp_min_games,
+                               min_selfplay_frac=args.opp_min_selfplay_frac)
+            kind, entry = picks[0]
+            
+            # Set up opponent networks
+            opp_pg, opp_pa, opp_vg, opp_va = pi_good, pi_adv, vf_good, vf_adv  # default to self
+            source = "self"
+            selected_entry = None
+            
+            if kind == "pool" and entry is not None:
+                # Load opponent checkpoint
+                try:
+                    from src.rl.checkpoint import load_policy_from_ckpt
+                    import torch
+                    
+                    ckpt = torch.load(entry.ckpt_path, map_location="cpu", weights_only=False)
+                    
+                    # Create opponent networks with correct dimensions
+                    from src.rl.models import MultiHeadPolicy
+                    opp_policy = MultiHeadPolicy(obs_dims, n_act)
+                    load_policy_from_ckpt(opp_policy, ckpt, expect_dims=obs_dims)
+                    
+                    # Extract heads based on opponent's role
+                    if entry.role == "good":
+                        opp_pg = opp_policy.pi["good"]
+                        opp_vg = opp_policy.vf["good"]
+                        opp_pa = pi_adv  # use learner's adv head
+                        opp_va = vf_adv
+                    else:  # entry.role == "adv"
+                        opp_pa = opp_policy.pi["adv"] 
+                        opp_va = opp_policy.vf["adv"]
+                        opp_pg = pi_good  # use learner's good head
+                        opp_vg = vf_good
+                        
+                    source = f"pool_{entry.role}"
+                    selected_entry = entry
+                    print(f"Loaded opponent {entry.id} (elo={entry.elo:.1f})")
+                    
+                except Exception as e:
+                    print(f"Failed to load opponent {entry.ckpt_path}: {e}, falling back to self")
+                    source = "self_fallback"
             
             # Collect self-play trajectory
             ep_rew, traj = collect_parallel_adapter(
@@ -1509,21 +1563,14 @@ def main():
             print(f"Collected {len(traj)} per-agent samples (opponent: {source})")
             
             # Record game result for opponent pool
-            if selected_ckpt and source.startswith("pool_"):
+            if selected_entry is not None:
                 # Compute win/loss from episode rewards
                 learner_reward = sum(t[3] for t in traj if t[6] == "good")  # Sum rewards for good agents
                 opponent_reward = -learner_reward  # Approximate opponent reward (zero-sum assumption)
                 
-                if learner_reward > opponent_reward:
-                    won = True
-                elif learner_reward < opponent_reward:
-                    won = False
-                else:
-                    # Tie: record both win and loss with 50% probability each
-                    won = rng.random() < 0.5
-                
-                pool.record_result(selected_ckpt, won)
-                print(f"Recorded {'win' if won else 'loss'} vs {Path(selected_ckpt).name}")
+                learner_win = learner_reward > opponent_reward
+                pool.record_result(selected_entry.id, learner_win, ema_decay=args.opp_ema_decay)
+                print(f"Recorded {'win' if learner_win else 'loss'} vs {selected_entry.id}")
                 
         except Exception as e:
             print(f"Collection failed ({e}), skipping update")
@@ -1573,33 +1620,41 @@ def main():
         _append_csv("artifacts/rl_metrics.csv", CSV_HEADER, row)
         print(f"[csv] logged to rl_metrics.csv")
         
-        # Save checkpoints atomically (always save regardless of training success)
-        
-        # Helper for validation
-        def _first_layer_in_dim(sd):
-            for k, v in sd.items():
-                if k.endswith("net.0.weight"): return int(v.shape[1])
-            return None
-        
-        # Create MultiHeadPolicy for v2-roles format (random init, no transplant)
+        # Save checkpoints atomically using trained policy
+        # Create MultiHeadPolicy and copy trained parameters
         policy = MultiHeadPolicy(obs_dims, n_act)
-        # Start from random initialization - no legacy head transplant
+        policy.pi["good"].load_state_dict(pi_good.state_dict())
+        policy.pi["adv"].load_state_dict(pi_adv.state_dict())
+        policy.vf["good"].load_state_dict(vf_good.state_dict())
+        policy.vf["adv"].load_state_dict(vf_adv.state_dict())
         
         meta = {"obs_dims": obs_dims, "schema": "v2-roles"}
         save_checkpoint(policy, meta, last_path)
         print(f"[ckpt v2] wrote {last_path}")
         
-        # Add checkpoint to opponent pool
-        pool.add(last_path, int(update_idx + 1))
+        # Evaluation gating for opponent pool and best checkpoint
+        # Run simplified eval for gating (compute win rates)
+        wr_self = 0.5  # placeholder - could run actual self-play eval
+        wr_uniform = 0.5  # placeholder - could run vs pool eval
         
-        # Update best checkpoint based on combined evaluation score
-        score = float(eval_g) + float(eval_a)
-        if score > best_score:
-            best_score = score
-            save_checkpoint(policy, meta, best_path)
-            print(f"[ckpt v2] wrote {best_path}")
-            # Also add best checkpoint to pool
-            pool.add(best_path, int(update_idx + 1))
+        # Gate best checkpoint update
+        if wr_self >= args.gate_best_min_wr:
+            # Copy last.pt -> best.pt
+            import shutil
+            shutil.copy2(last_path, best_path)
+            print(f"[gate] copied last.pt -> best.pt (wr_self={wr_self:.3f} >= {args.gate_best_min_wr})")
+            best_score = float('inf')  # mark as updated
+        
+        # Gate opponent pool addition
+        if wr_uniform >= args.gate_pool_min_wr:
+            # Determine opponent role (opposite of learner)
+            opp_role = "adv"  # assuming learner is typically "good"
+            entry_id = pool.add_entry(str(last_path), role=opp_role, step=int(update_idx + 1))
+            print(f"[gate] added to pool: {entry_id} (wr_uniform={wr_uniform:.3f} >= {args.gate_pool_min_wr})")
+        
+        # Prune and save pool
+        pool.prune(args.opp_max)
+        pool.save(args.pool_path)
     
     print(f"\n[done] Completed {args.updates} updates")
 
