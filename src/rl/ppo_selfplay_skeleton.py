@@ -18,9 +18,35 @@ from src.rl.env_utils import get_role_maps
 from src.rl.models import MultiHeadPolicy, MultiHeadValue, PolicyHead, ValueHead, DimAdapter
 from src.rl.env_api import make_adapter
 from src.rl.checkpoint import save_checkpoint, load_policy_from_ckpt, load_legacy_checkpoint
+from src.rl.rollout import collect_rollouts
 import src.rl.adapters  # Import to register adapters
 
 N_ACT = 5  # Simple Adversary discrete actions: no-op, left, right, down, up
+
+
+def load_opponent_head(policy, entry):
+    """Load opponent checkpoint and update the appropriate role head in policy."""
+    if entry is None:
+        return
+    
+    try:
+        # Load opponent checkpoint
+        opp_ckpt = torch.load(entry.ckpt_path, map_location="cpu", weights_only=False)
+        opp_policy = MultiHeadPolicy(policy.obs_dims, N_ACT)
+        load_policy_from_ckpt(opp_policy, opp_ckpt, expect_dims=policy.obs_dims)
+        
+        # Load opponent head based on entry role
+        if entry.role == "good":
+            policy.pi["good"].load_state_dict(opp_policy.pi["good"].state_dict())
+            policy.vf["good"].load_state_dict(opp_policy.vf["good"].state_dict())
+        elif entry.role == "adv":
+            policy.pi["adv"].load_state_dict(opp_policy.pi["adv"].state_dict())
+            policy.vf["adv"].load_state_dict(opp_policy.vf["adv"].state_dict())
+        else:
+            print(f"Warning: Unknown role '{entry.role}' for opponent {entry.id}")
+            
+    except Exception as e:
+        print(f"Failed to load opponent head for {entry.id}: {e}")
 
 
 def make_env_adapter(env_name: str, seed: int):
@@ -534,7 +560,7 @@ def collect_rollout(env, policy, value_fn, steps=256):
     if isinstance(obs, tuple):
         obs, _info = obs  # PettingZoo Parallel: (obs_dict, info_dict)
     if isinstance(obs, dict):
-        raise RuntimeError("Parallel obs dict detected; use collect_parallel_mpe()")
+        raise RuntimeError("Parallel obs dict detected; DEPRECATED: Legacy collectors no longer supported, use collect_rollouts()")
     
     if not hasattr(obs, '__len__') or len(obs.shape) == 0:
         obs = np.random.randn(obs_dim)  # Fallback for mock
@@ -982,6 +1008,8 @@ def selfplay_smoke_train(steps=1024, save_dir: Path = None):
         # Pick opponent for this episode
         opp_pg, opp_pa, source = mm.pick_opponent(pi_good, pi_adv)
         
+        # TODO: Update to use new collect_rollouts system
+        print("WARNING: This demo function uses legacy collector - needs update")
         ep_rew, traj = collect_parallel_adapter(
             adapter, pi_good, pi_adv, opp_pg, opp_pa, vf_good, vf_adv,
             learner_role="good", 
@@ -1144,6 +1172,8 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0, save_dir: Path = No
         adv_dim = obs_dims["adv"] 
         pi_good, vf_good = PolicyHead(good_dim, n_act=n_actions), ValueHead(good_dim)
         pi_adv, vf_adv = PolicyHead(adv_dim, n_act=n_actions), ValueHead(adv_dim)
+        # TODO: Update to use new collect_rollouts system
+        print("WARNING: This smoke function uses legacy collector - needs update")
         ep_rew, traj = collect_parallel_adapter(adapter, pi_good, pi_adv, pi_good, pi_adv, vf_good, vf_adv,
                                            learner_role="good", steps=steps, device="cpu")
         # Convert to batch format
@@ -1552,84 +1582,60 @@ def main():
         if args.curriculum != "off":
             print(f"Curriculum: progress={progress:.3f}, level={lvl:.2f}")
         
-        # Sample opponent using Elo-based pool
+        # Sample opponent using Elo-based pool  
         try:
             # Sample 1 opponent for this episode
             picks = pool.sample(n=1, temp=args.opp_temp, min_games=args.opp_min_games,
                                min_selfplay_frac=args.opp_min_selfplay_frac)
-            kind, entry = picks[0]
-            
-            # Set up opponent networks
-            opp_pg, opp_pa, opp_vg, opp_va = pi_good, pi_adv, vf_good, vf_adv  # default to self
-            source = "self"
             selected_entry = None
             
-            if kind == "pool" and entry is not None:
-                # Load opponent checkpoint
-                try:
-                    from src.rl.checkpoint import load_policy_from_ckpt
-                    import torch
-                    
-                    ckpt = torch.load(entry.ckpt_path, map_location="cpu", weights_only=False)
-                    
-                    # Create opponent networks with correct dimensions
-                    from src.rl.models import MultiHeadPolicy
-                    opp_policy = MultiHeadPolicy(obs_dims, n_act)
-                    load_policy_from_ckpt(opp_policy, ckpt, expect_dims=obs_dims)
-                    
-                    # Extract heads based on opponent's role
-                    if entry.role == "good":
-                        opp_pg = opp_policy.pi["good"]
-                        opp_vg = opp_policy.vf["good"]
-                        opp_pa = pi_adv  # use learner's adv head
-                        opp_va = vf_adv
-                    else:  # entry.role == "adv"
-                        opp_pa = opp_policy.pi["adv"] 
-                        opp_va = opp_policy.vf["adv"]
-                        opp_pg = pi_good  # use learner's good head
-                        opp_vg = vf_good
-                        
-                    source = f"pool_{entry.role}"
-                    selected_entry = entry
-                    print(f"Loaded opponent {entry.id} (elo={entry.elo:.1f})")
-                    
-                except Exception as e:
-                    print(f"Failed to load opponent {entry.ckpt_path}: {e}, falling back to self")
-                    source = "self_fallback"
+            # Build match plan from picks
+            match_plan = picks if picks else [("self", None)]
             
-            # Collect self-play trajectory
-            ep_rew, traj = collect_parallel_adapter(
-                adapter, pi_good, pi_adv, opp_pg, opp_pa, vf_good, vf_adv,
-                learner_role="good", 
-                steps=args.rollout_steps, 
-                device="cpu",
-                curriculum_level=lvl if args.curriculum != "off" else None,
-                norms=norms,
-                obs_norm=args.obs_norm
+            # Build observation transform from norms if enabled
+            obs_tf = {}
+            if args.obs_norm and norms:
+                for role in norms:
+                    # Create closure to capture norm instance
+                    obs_tf[role] = lambda arr, rn=norms[role]: rn.transform(arr)
+            
+            # Apply curriculum difficulty if specified
+            if lvl is not None and args.curriculum != "off" and hasattr(adapter, "set_difficulty"):
+                adapter.set_difficulty(lvl)
+            
+            # Collect rollouts using adapter-native collector
+            batch, counts = collect_rollouts(
+                adapter=adapter,
+                policy=policy,
+                roles=roles,
+                agents=agents,
+                per_agent_steps=args.rollout_steps,
+                seed=args.seed + update_idx * 1000,
+                gamma=0.99,
+                gae_lambda=0.95,
+                obs_transform=obs_tf,
+                match_plan=match_plan,
+                load_opponent=load_opponent_head,
             )
-            print(f"Collected {len(traj)} per-agent samples (opponent: {source})")
+            
+            print(f"[collector] adapter_native | per-agent steps: " +
+                  ", ".join([f"{r}={counts[r]}" for r in counts]))
             
             # Record game result for opponent pool
-            if selected_entry is not None:
-                # Compute win/loss from episode rewards
-                learner_reward = sum(t[3] for t in traj if t[6] == "good")  # Sum rewards for good agents
-                opponent_reward = -learner_reward  # Approximate opponent reward (zero-sum assumption)
-                
-                learner_win = learner_reward > opponent_reward
-                pool.record_result(selected_entry.id, learner_win, ema_decay=args.opp_ema_decay)
-                print(f"Recorded {'win' if learner_win else 'loss'} vs {selected_entry.id}")
+            if picks and len(picks) > 0 and picks[0][0] == "pool":
+                entry = picks[0][1]
+                selected_entry = entry
+                # Estimate win/loss from collected advantages (heuristic)
+                learner_role = "good"  # Assume learner plays good role
+                if learner_role in batch.adv and len(batch.adv[learner_role]) > 0:
+                    avg_adv = float(batch.adv[learner_role].mean().item())
+                    learner_win = avg_adv > 0  # Positive advantage suggests good performance
+                    pool.record_result(selected_entry.id, learner_win, ema_decay=args.opp_ema_decay)
+                    print(f"Recorded {'win' if learner_win else 'loss'} vs {selected_entry.id} (avg_adv={avg_adv:.3f})")
                 
         except Exception as e:
             print(f"Collection failed ({e}), skipping update")
             continue
-        
-        if not traj:
-            print("No trajectory collected, skipping update")
-            continue
-        
-        # Split trajectory by role and run PPO per role
-        batch_g = _make_batch(traj, "good")
-        batch_a = _make_batch(traj, "adv")
         
         # Learning rate and entropy coefficient scheduling
         frac = 1.0 - (update_idx / max(1, args.updates))
@@ -1638,10 +1644,20 @@ def main():
         for g in optimizer.param_groups:
             g["lr"] = current_lr
         
-        # Run PPO per role with new hyperparameters
+        # Run PPO per role with new batch format
         kl_g = kl_a = ent_g = ent_a = 0.0
         
-        if batch_g:
+        # Process good role
+        if "good" in batch.obs and len(batch.obs["good"]) > 0:
+            # Convert batch to format expected by ppo_update
+            batch_g = {
+                'obs': batch.obs["good"],
+                'act': batch.act["good"],
+                'logp': batch.logp["good"],
+                'val': batch.val["good"],
+                'adv': batch.adv["good"],
+                'ret': batch.ret["good"]
+            }
             try:
                 pi_g, vf_g, kl_g, ent_g = ppo_update(
                     pi_good, vf_good, optimizer, batch_g,
@@ -1657,7 +1673,17 @@ def main():
             except Exception as e:
                 print(f"PPO update failed for good agents: {e}")
         
-        if batch_a:
+        # Process adv role
+        if "adv" in batch.obs and len(batch.obs["adv"]) > 0:
+            # Convert batch to format expected by ppo_update
+            batch_a = {
+                'obs': batch.obs["adv"],
+                'act': batch.act["adv"],
+                'logp': batch.logp["adv"],
+                'val': batch.val["adv"],
+                'adv': batch.adv["adv"],
+                'ret': batch.ret["adv"]
+            }
             try:
                 pi_a, vf_a, kl_a, ent_a = ppo_update(
                     pi_adv, vf_adv, optimizer, batch_a,
