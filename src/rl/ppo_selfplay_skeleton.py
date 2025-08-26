@@ -7,7 +7,9 @@ import argparse
 import csv
 import os
 import random
+import shutil
 import signal
+import subprocess
 import tempfile
 import time
 import numpy as np
@@ -20,6 +22,7 @@ from src.rl.env_utils import get_role_maps
 from src.rl.models import MultiHeadPolicy, MultiHeadValue, PolicyHead, ValueHead, DimAdapter
 from src.rl.env_api import make_adapter
 from src.rl.checkpoint import save_checkpoint, load_policy_from_ckpt, load_legacy_checkpoint, save_bundle, load_bundle
+from src.rl.ckpt_io import make_bundle, save_checkpoint_v3, load_checkpoint_auto, capture_rng_state, restore_rng_state, _git_commit
 from src.rl.rollout import collect_rollouts
 import src.rl.adapters  # Import to register adapters
 
@@ -1514,65 +1517,106 @@ def main():
     global_step = 0
     updates_done = 0
     
+    # Resume from checkpoint if requested or auto-resume if last.pt exists
+    resume_path = None
     if args.resume:
-        bundle_path = args.resume
-        if os.path.isdir(bundle_path):
-            bundle_path = os.path.join(bundle_path, "last.pt")
-        print(f"[resume] loading {bundle_path}")
+        resume_path = Path(args.resume)
+    elif (save_dir / "last.pt").exists():
+        resume_path = save_dir / "last.pt"
+        print(f"[auto-resume] found {resume_path}")
         
+    if resume_path:
+        print(f"[resume] loading from {resume_path}")
         try:
-            b = load_bundle(bundle_path)
+            kind, obj = load_checkpoint_auto(resume_path)
             
-            # dims/env sanity check
-            b_dims = b["meta"]["obs_dims"]
-            b_env = b["meta"]["env"]
-            assert b_env == args.env, f"resume env {b_env} != {args.env}"
-            for r in b_dims: 
-                assert b_dims[r] == obs_dims[r], f"resume dims mismatch for {r}"
-            
-            # model
-            policy.load_state_dict(b["model"])
-            
-            # optim/sched
-            for r in roles_set:
-                opt[r].load_state_dict(b["optim"][r])
-                if b["sched"].get(r): 
-                    sched[r].load_state_dict(b["sched"][r])
-            
-            # norms
-            if "norm" in b["meta"]:
-                for r in roles_set: 
-                    norms[r].load_state_dict(b["meta"]["norm"][r])
-            
-            # rng
-            torch.set_rng_state(b["rng"]["torch"])
-            np.random.set_state(b["rng"]["numpy"])
-            random.setstate(b["rng"]["python"])
-            
-            # counters
-            global_step = int(b["meta"].get("global_step", 0))
-            updates_done = int(b["meta"].get("updates", 0))
-            print(f"[resume] step={global_step} updates={updates_done}")
-            
+            if kind == "v3":
+                # Full v3 bundle resume
+                # Sanity checks
+                bundle_dims = obj["meta"]["obs_dims"]
+                bundle_env = obj["meta"]["env"]
+                if bundle_env != args.env:
+                    raise ValueError(f"resume env {bundle_env} != {args.env}")
+                for r in bundle_dims:
+                    if bundle_dims[r] != obs_dims[r]:
+                        raise ValueError(f"resume dims mismatch for {r}: {bundle_dims[r]} != {obs_dims[r]}")
+                
+                # Load model
+                policy.load_state_dict(obj["model_state"])
+                
+                # Load optimizers
+                for r in roles_set:
+                    if r in obj["optim_state"]:
+                        opt[r].load_state_dict(obj["optim_state"][r])
+                
+                # Load schedulers
+                if obj.get("sched_state") and sched:
+                    for r in roles_set:
+                        if obj["sched_state"].get(r) and sched.get(r):
+                            sched[r].load_state_dict(obj["sched_state"][r])
+                
+                # Load normalizers
+                if obj.get("obs_norm_state"):
+                    for r in roles_set:
+                        if r in obj["obs_norm_state"]:
+                            norms[r].load_state_dict(obj["obs_norm_state"][r])
+                
+                # Restore RNG state
+                restore_rng_state(obj)
+                
+                # Restore counters
+                global_step = obj["counters"].get("global_step", 0)
+                updates_done = obj["counters"].get("update_idx", 0)
+                
+                print(f"[resume v3] step={global_step} updates={updates_done}")
+                
+            elif kind == "model_only":
+                # Model-only resume - yellow warning
+                print("\033[93m[WARNING] Resuming from model-only checkpoint - optimizer/scheduler/RNG state will be fresh\033[0m")
+                
+                # Load only model state
+                if "model" in obj:
+                    policy.load_state_dict(obj["model"])
+                else:
+                    policy.load_state_dict(obj)
+                    
+                print("[resume model-only] loaded model weights only")
+                
         except Exception as e:
-            print(f"Failed to resume from bundle {bundle_path}: {e}")
+            print(f"Failed to resume from {resume_path}: {e}")
             print("Starting fresh training")
     
     # SIGINT/SIGTERM safe-save handlers
     import functools
     
     def _on_interrupt(signum, frame):
-        intr = save_dir / "interrupted.pt"
-        current_meta = {
-            "env": args.env,
-            "obs_dims": obs_dims,
-            "seed": args.seed,
-            "global_step": global_step,
-            "updates": updates_done,
-            "pool_path": args.pool_path,
-        }
-        save_bundle(intr, policy, opt, sched, current_meta, norms, args)
-        print(f"[ckpt v3] wrote {intr} (interrupt)")
+        # Create interrupt bundle with current state
+        intr_bundle = make_bundle(
+            version=3,
+            model_state=policy.state_dict(),
+            optim_state={r: opt[r].state_dict() for r in opt},
+            sched_state={r: sched[r].state_dict() for r in sched} if sched else None,
+            obs_norm_state={r: norms[r].state_dict() for r in norms},
+            adv_norm_state=None,
+            rng_state=capture_rng_state(),
+            counters={
+                "global_step": global_step,
+                "update_idx": updates_done,
+                "episodes": updates_done
+            },
+            meta={
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "env": args.env,
+                "adapter": args.env,
+                "git_commit": _git_commit(),
+                "seed": args.seed,
+                "obs_dims": obs_dims
+            }
+        )
+        # Save interrupt bundle  
+        intr_path = save_dir / "interrupted.pt"
+        torch.save(intr_bundle, intr_path)
+        print(f"[ckpt v3] wrote {intr_path.name} (interrupt)")
         raise SystemExit(130)
     
     for s in (signal.SIGINT, signal.SIGTERM):
@@ -1730,22 +1774,34 @@ def main():
         last_bundle = save_dir / "last.pt"
         last_model = save_dir / "last_model.pt"
         
-        meta = {
-            "env": args.env,
-            "obs_dims": obs_dims,
-            "seed": args.seed,
-            "global_step": global_step,
-            "updates": updates_done,
-            "pool_path": getattr(args, "pool_path", None),
-        }
+        # Create v3 bundle with new API
+        bundle = make_bundle(
+            version=3,
+            model_state=policy.state_dict(),
+            optim_state={r: opt[r].state_dict() for r in opt},
+            sched_state={r: sched[r].state_dict() for r in sched} if sched else None,
+            obs_norm_state={r: norms[r].state_dict() for r in norms},
+            adv_norm_state=None,  # No advantage normalizer in current setup
+            rng_state=capture_rng_state(),
+            counters={
+                "global_step": global_step,
+                "update_idx": updates_done, 
+                "episodes": updates_done  # Rough proxy
+            },
+            meta={
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "env": args.env,
+                "adapter": args.env,
+                "git_commit": _git_commit(),
+                "seed": args.seed,
+                "obs_dims": obs_dims
+            }
+        )
         
-        # v3 bundle (model + optim + sched + norms + RNG + args)
-        save_bundle(last_bundle, policy, opt, sched, meta, norms, args)
-        print(f"[ckpt v3] wrote {last_bundle}")
-        
-        # v2 model-only (for eval_cli)
-        save_checkpoint(policy, {"obs_dims": obs_dims, "schema": "v2-roles"}, last_model)
-        print(f"[ckpt v2] wrote {last_model}")
+        # Atomically save v3 bundle and model-only checkpoint
+        bundle_path, model_path = save_checkpoint_v3(bundle, save_dir)
+        print(f"[ckpt v3] saved {bundle_path.name}")
+        print(f"[ckpt v2] saved {model_path.name}")
         
         # Evaluation gating for opponent pool and best checkpoint
         # Run simplified eval for gating (compute win rates)
@@ -1754,17 +1810,9 @@ def main():
         
         # Gate best checkpoint update
         if wr_self >= args.gate_best_min_wr:
-            # Save best bundle and model-only versions
-            best_bundle = save_dir / "best.pt"  
-            best_model = save_dir / "best_model.pt"
-            
-            # v3 bundle (complete state)
-            save_bundle(best_bundle, policy, opt, sched, meta, norms, args)
-            print(f"[ckpt v3] wrote {best_bundle}")
-            
-            # v2 model-only (for eval_cli)
-            save_checkpoint(policy, {"obs_dims": obs_dims, "schema": "v2-roles"}, best_model)
-            print(f"[ckpt v2] wrote {best_model}")
+            # Create best.pt and best_model.pt from current bundle
+            shutil.copy2(save_dir / "last.pt", save_dir / "best.pt")
+            shutil.copy2(save_dir / "last_model.pt", save_dir / "best_model.pt")
             
             print(f"[gate] saved best checkpoints (wr_self={wr_self:.3f} >= {args.gate_best_min_wr})")
             best_score = float('inf')  # mark as updated

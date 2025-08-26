@@ -17,6 +17,7 @@ from src.rl.ppo_selfplay_skeleton import PolicyHead, ValueHead, N_ACT
 from src.rl.env_api import make_adapter
 from src.rl.models import MultiHeadPolicy, DimAdapter
 from src.rl.checkpoint import load_policy_from_ckpt, load_legacy_checkpoint
+from src.rl.ckpt_io import load_checkpoint_auto
 from src.rl.normalizer import RunningNorm
 import src.rl.adapters  # Import to register adapters
 
@@ -174,22 +175,28 @@ def main():
                 return int(v.shape[0])  # [n_act, hidden]
         return None
     
-    # Load checkpoint
+    # Load checkpoint using new API
     norms = {}  # Initialize empty norms dict
     try:
-        obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)  # trusted local file
+        kind, obj = load_checkpoint_auto(ckpt_path)
         
-        # Handle v3 bundle compatibility
-        if isinstance(obj, dict) and obj.get("schema") == "v3-train-bundle":
+        if kind == "v3":
             print("Loading v3 training bundle...")
-            sd = obj["model"]                     # unwrap bundle
-            meta = obj["meta"]
-            ckpt = {"model": sd, "meta": meta}
+            # Extract model state and metadata from v3 bundle
+            ckpt = {"model": obj["model_state"], "meta": obj["meta"]}
+            
+            # Load observation normalizers if present
+            if obj.get("obs_norm_state"):
+                print("Loading frozen normalizers from v3 bundle...")
+                for role, norm_state in obj["obs_norm_state"].items():
+                    norms[role] = RunningNorm()
+                    norms[role].load_state_dict(norm_state)
+                    print(f"  {role}: count={norms[role].count:.0f}")
         else:
-            sd = obj.get("model", obj)            # v2 or raw state_dict
+            print("Loading model-only checkpoint...")
             ckpt = obj
         
-        # STRICT: Get dimensions from checkpoint metadata only
+        # Get dimensions from checkpoint metadata
         saved_dims = ckpt.get("meta", {}).get("obs_dims")
         if saved_dims is None:
             raise ValueError(
@@ -219,44 +226,23 @@ def main():
         print(f"[checkpoint obs_dims] good={saved_dims['good']}, adv={saved_dims['adv']}")
         print(f"[model expects] good={saved_dims['good']}, adv={saved_dims['adv']}")
         
-        # Check checkpoint format and schema
+        # Load model using robust policy loading
         try:
-            if isinstance(obj, dict) and obj.get("schema") == "v3-train-bundle":
-                # v3 bundle - extract model state dict
-                sd = obj["model"] 
-                meta = obj["meta"]
-                schema = "v3-train-bundle"
-            else:
-                # Regular checkpoint - use legacy loader
-                sd, meta = load_legacy_checkpoint(ckpt_path)
-                schema = meta.get("schema", "unknown")
-                
-            print(f"schema: {schema}")
+            print(f"[checkpoint kind] {kind}")
             
-            # Validate role structure
-            has_roles = any(k.startswith(("pi.good.","pi.adv.","vf.good.","vf.adv.")) for k in sd.keys())
+            # Validate role structure in model state dict
+            model_sd = ckpt["model"]
+            has_roles = any(k.startswith(("pi.good.","pi.adv.","vf.good.","vf.adv.")) for k in model_sd.keys())
             if not has_roles:
                 raise SystemExit("[fatal] legacy checkpoint without role labels. Re-train a new checkpoint after the v2-roles patch.")
             
-            # Load checkpoint using robust policy loading
-            if schema == "v3-train-bundle":
-                # Direct state dict loading for v3 bundles
-                policy.load_state_dict(sd)
-                saved_dims = meta["obs_dims"]
-            else:
-                saved_dims = load_policy_from_ckpt(policy, ckpt, expect_dims=saved_dims)
+            # Load policy using existing robust loader
+            saved_dims = load_policy_from_ckpt(policy, ckpt, expect_dims=saved_dims)
             print(f"[policy dims] using ckpt dims: good={saved_dims['good']} adv={saved_dims['adv']}")
             
-            # Load frozen normalizers if available
-            norm_meta = meta.get('norm')
-            if norm_meta:
-                print("Loading frozen normalizers from checkpoint...")
-                for role, norm_state in norm_meta.items():
-                    norms[role] = RunningNorm()
-                    norms[role].load_state_dict(norm_state)
-                    print(f"  {role}: count={norms[role].count:.0f}, mean_norm={abs(norms[role].mean).mean() if norms[role].mean is not None else 0:.3f}")
-            else:
-                print("No normalizers found in checkpoint metadata")
+            # Normalizers already loaded above for v3 bundles
+            if kind != "v3" and not norms:
+                print("No normalizers found in model-only checkpoint")
             
         except Exception as e:
             print(f"Checkpoint loading failed: {e}")
