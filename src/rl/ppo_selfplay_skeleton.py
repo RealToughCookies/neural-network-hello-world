@@ -9,6 +9,7 @@ import os
 import random
 import signal
 import tempfile
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,7 +19,7 @@ from pathlib import Path
 from src.rl.env_utils import get_role_maps
 from src.rl.models import MultiHeadPolicy, MultiHeadValue, PolicyHead, ValueHead, DimAdapter
 from src.rl.env_api import make_adapter
-from src.rl.checkpoint import save_checkpoint, load_policy_from_ckpt, load_legacy_checkpoint
+from src.rl.checkpoint import save_checkpoint, load_policy_from_ckpt, load_legacy_checkpoint, save_bundle, load_bundle
 from src.rl.rollout import collect_rollouts
 import src.rl.adapters  # Import to register adapters
 
@@ -1500,7 +1501,6 @@ def main():
     
     # Create MultiHeadPolicy and per-role optimizers/schedulers
     policy = MultiHeadPolicy(obs_dims, N_ACT)
-    from src.rl.checkpoint import save_bundle, load_bundle, save_checkpoint
     
     roles_set = sorted(set(roles.values()))  # e.g., ["adv", "good"]
     

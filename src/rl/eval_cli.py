@@ -111,27 +111,13 @@ def main():
         parser.error("the following arguments are required: --ckpt")
     
     # Resolve checkpoint path with directory support
-    ckpt_path = Path(args.ckpt).expanduser().resolve(strict=False)
+    path = args.ckpt
+    if os.path.isdir(path):
+        m = os.path.join(path, "last_model.pt")
+        path = m if os.path.exists(m) else os.path.join(path, "last.pt")
+        print(f"Directory provided, auto-selected: {os.path.basename(path)}")
     
-    # If directory provided, auto-select appropriate checkpoint file
-    if ckpt_path.exists() and ckpt_path.is_dir():
-        # Prefer last_model.pt for eval compatibility, fallback to last.pt
-        candidates = ["last_model.pt", "last.pt", "best_model.pt", "best.pt"]
-        selected = None
-        for candidate in candidates:
-            candidate_path = ckpt_path / candidate
-            if candidate_path.exists():
-                selected = candidate_path
-                break
-        
-        if selected:
-            print(f"Directory provided, auto-selected: {selected.name}")
-            ckpt_path = selected
-        else:
-            available = ", ".join(sorted(p.name for p in ckpt_path.glob("*.pt")))
-            if not available:
-                available = "<no .pt files>"
-            raise SystemExit(f"No suitable checkpoint found in directory: {ckpt_path}\nAvailable: {available}")
+    ckpt_path = Path(path).expanduser().resolve(strict=False)
     
     print(f"Evaluating checkpoint: {ckpt_path}")
     print(f"Environment: {args.env}, Episodes: {args.episodes}")
@@ -196,8 +182,11 @@ def main():
         # Handle v3 bundle compatibility
         if isinstance(obj, dict) and obj.get("schema") == "v3-train-bundle":
             print("Loading v3 training bundle...")
-            ckpt = {"model": obj["model"], "meta": obj["meta"]}
+            sd = obj["model"]                     # unwrap bundle
+            meta = obj["meta"]
+            ckpt = {"model": sd, "meta": meta}
         else:
+            sd = obj.get("model", obj)            # v2 or raw state_dict
             ckpt = obj
         
         # STRICT: Get dimensions from checkpoint metadata only
