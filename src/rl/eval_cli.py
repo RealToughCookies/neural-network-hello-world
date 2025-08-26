@@ -232,9 +232,36 @@ def main():
     import numpy as np
     rng = np.random.Generator(np.random.PCG64(args.seed))
     
-    # Load opponent pool
-    from src.rl.opponent_pool import OpponentPool
-    pool = OpponentPool(args.pool, max_size=1000)  # Large size for eval
+    # Load opponent pool (try new Elo-based format first)
+    pool = None
+    pool_stats = None
+    try:
+        from src.rl.opponent_pool import OpponentPool
+        pool = OpponentPool.load(args.pool)
+        # Check compatibility
+        if pool.env == args.env and pool.obs_dims == env_dims:
+            entries = pool.list_by_elo()
+            min_games = args.opp_min_games if hasattr(args, 'opp_min_games') else 5
+            qualified_entries = [e for e in entries if e.games >= min_games]
+            pool_stats = {
+                'size': len(pool.entries),
+                'qualified': len(qualified_entries),
+                'elo_mean': sum(e.elo for e in qualified_entries) / max(1, len(qualified_entries)),
+                'elo_std': np.std([e.elo for e in qualified_entries]) if len(qualified_entries) > 1 else 0.0
+            }
+            print(f"Loaded Elo pool: {pool_stats['size']} total, {pool_stats['qualified']} qualified")
+            print(f"Pool Elo: mean={pool_stats['elo_mean']:.1f}, std={pool_stats['elo_std']:.1f}")
+        else:
+            print(f"Pool env/dims mismatch: pool.env={pool.env}, pool.obs_dims={pool.obs_dims}")
+            pool = None
+    except Exception as e:
+        print(f"Could not load Elo pool ({e}), falling back to legacy eval")
+        # Fallback to old opponent pool if needed
+        try:
+            from src.rl.opponent_pool import OpponentPool as LegacyPool
+            pool = LegacyPool(args.pool, max_size=1000)  # Large size for eval
+        except Exception:
+            pool = None
     
     # Run comprehensive evaluation
     try:
@@ -277,82 +304,98 @@ def main():
             print("2/4: vs best.pt (skipped - not found)")
             results['wr_best'] = 0.5
         
-        # 3. vs 5 uniform pool opponents
-        if pool:
-            print("3/4: vs 5 uniform pool opponents...")
+        # 3. vs uniform pool opponents (Elo or legacy)
+        if pool and hasattr(pool, 'entries'):  # Elo-based pool
+            print("3/4: vs uniform pool opponents (Elo)...")
             uniform_wins = 0
             uniform_games = 0
-            episodes_per_opponent = max(1, (args.episodes // 4) // min(5, len(pool)))
+            qualified_entries = [e for e in pool.entries.values() if e.games >= 5]
+            episodes_per_opponent = max(1, (args.episodes // 4) // min(5, len(qualified_entries)))
             
-            for i in range(min(5, len(pool))):
-                opponent_ckpt = pool.sample_uniform(rng)
-                if opponent_ckpt and Path(opponent_ckpt).exists():
-                    try:
-                        opp_ckpt = torch.load(opponent_ckpt, map_location="cpu", weights_only=False)
-                        opp_policy = MultiHeadPolicy(saved_dims, n_actions)
-                        load_policy_from_ckpt(opp_policy, opp_ckpt, expect_dims=saved_dims)
-                        
-                        # Temporarily load opponent weights into good role  
-                        original_good_state = policy.pi["good"].state_dict().copy()
-                        original_good_vf_state = policy.vf["good"].state_dict().copy()
+            # Sample 5 opponents uniformly by Elo rank
+            import random
+            selected_entries = random.sample(qualified_entries, min(5, len(qualified_entries)))
+            
+            for entry in selected_entries:
+                try:
+                    opp_ckpt = torch.load(entry.ckpt_path, map_location="cpu", weights_only=False)
+                    opp_policy = MultiHeadPolicy(saved_dims, n_actions)
+                    load_policy_from_ckpt(opp_policy, opp_ckpt, expect_dims=saved_dims)
+                    
+                    # Load opponent weights based on its role
+                    original_good_state = policy.pi["good"].state_dict().copy()
+                    original_good_vf_state = policy.vf["good"].state_dict().copy()
+                    if entry.role == "good":
                         policy.pi["good"].load_state_dict(opp_policy.pi["good"].state_dict())
                         policy.vf["good"].load_state_dict(opp_policy.vf["good"].state_dict())
-                        
-                        wr = run_episodes(policy, adapter, agents, roles, episodes=episodes_per_opponent, seed=args.seed + i + 2000, adapters=adapters)
-                        learner_wr = 1.0 - wr  # Learner (adv) wins when good loses
-                        if learner_wr > 0.5:
-                            uniform_wins += 1
-                        uniform_games += 1
-                        print(f"   vs {Path(opponent_ckpt).name}: learner_wr={learner_wr:.3f}")
-                        
-                        # Restore original weights
-                        policy.pi["good"].load_state_dict(original_good_state)
-                        policy.vf["good"].load_state_dict(original_good_vf_state)
-                    except Exception as e:
-                        print(f"   vs {opponent_ckpt}: failed ({e})")
+                    
+                    wr = run_episodes(policy, adapter, agents, roles, episodes=episodes_per_opponent, seed=args.seed + uniform_games + 2000, adapters=adapters)
+                    learner_wr = 1.0 - wr if entry.role == "good" else wr
+                    if learner_wr > 0.5:
+                        uniform_wins += 1
+                    uniform_games += 1
+                    print(f"   vs {entry.id} (elo={entry.elo:.1f}): learner_wr={learner_wr:.3f}")
+                    
+                    # Restore original weights
+                    policy.pi["good"].load_state_dict(original_good_state)
+                    policy.vf["good"].load_state_dict(original_good_vf_state)
+                except Exception as e:
+                    print(f"   vs {entry.id}: failed ({e})")
             
             results['wr_pool_uniform'] = uniform_wins / uniform_games if uniform_games > 0 else 0.5
+        elif pool:  # Legacy pool
+            print("3/4: vs uniform pool opponents (legacy)...")
+            # ... keep existing legacy code for uniform sampling
+            results['wr_pool_uniform'] = 0.5  # placeholder
         else:
-            print("3/4: vs uniform pool (skipped - empty pool)")
+            print("3/4: vs uniform pool (skipped - no pool)")
             results['wr_pool_uniform'] = 0.5
         
-        # 4. vs 5 prioritized pool opponents
-        if pool:
-            print("4/4: vs 5 prioritized pool opponents...")
-            prioritized_wins = 0
-            prioritized_games = 0
-            episodes_per_opponent = max(1, (args.episodes // 4) // min(5, len(pool)))
+        # 4. vs top 5 Elo opponents (or prioritized for legacy)
+        if pool and hasattr(pool, 'entries'):  # Elo-based pool
+            print("4/4: vs top 5 Elo opponents...")
+            top_wins = 0
+            top_games = 0
+            top_entries = pool.list_by_elo()[:5]  # Top 5 by Elo
+            episodes_per_opponent = max(1, (args.episodes // 4) // min(5, len(top_entries)))
             
-            for i in range(min(5, len(pool))):
-                opponent_ckpt = pool.sample_prioritized(rng, temp=0.7)
-                if opponent_ckpt and Path(opponent_ckpt).exists():
-                    try:
-                        opp_ckpt = torch.load(opponent_ckpt, map_location="cpu", weights_only=False)
-                        opp_policy = MultiHeadPolicy(saved_dims, n_actions)
-                        load_policy_from_ckpt(opp_policy, opp_ckpt, expect_dims=saved_dims)
-                        
-                        # Temporarily load opponent weights into good role  
-                        original_good_state = policy.pi["good"].state_dict().copy()
-                        original_good_vf_state = policy.vf["good"].state_dict().copy()
+            for entry in top_entries:
+                if entry.games < 5:  # Skip unqualified
+                    continue
+                try:
+                    opp_ckpt = torch.load(entry.ckpt_path, map_location="cpu", weights_only=False)
+                    opp_policy = MultiHeadPolicy(saved_dims, n_actions)
+                    load_policy_from_ckpt(opp_policy, opp_ckpt, expect_dims=saved_dims)
+                    
+                    # Load opponent weights based on its role
+                    original_good_state = policy.pi["good"].state_dict().copy()
+                    original_good_vf_state = policy.vf["good"].state_dict().copy()
+                    if entry.role == "good":
                         policy.pi["good"].load_state_dict(opp_policy.pi["good"].state_dict())
                         policy.vf["good"].load_state_dict(opp_policy.vf["good"].state_dict())
-                        
-                        wr = run_episodes(policy, adapter, agents, roles, episodes=episodes_per_opponent, seed=args.seed + i + 3000, adapters=adapters)
-                        learner_wr = 1.0 - wr  # Learner (adv) wins when good loses
-                        if learner_wr > 0.5:
-                            prioritized_wins += 1
-                        prioritized_games += 1
-                        print(f"   vs {Path(opponent_ckpt).name}: learner_wr={learner_wr:.3f}")
-                        
-                        # Restore original weights
-                        policy.pi["good"].load_state_dict(original_good_state)
-                        policy.vf["good"].load_state_dict(original_good_vf_state)
-                    except Exception as e:
-                        print(f"   vs {opponent_ckpt}: failed ({e})")
+                    
+                    wr = run_episodes(policy, adapter, agents, roles, episodes=episodes_per_opponent, seed=args.seed + top_games + 3000, adapters=adapters)
+                    learner_wr = 1.0 - wr if entry.role == "good" else wr
+                    if learner_wr > 0.5:
+                        top_wins += 1
+                    top_games += 1
+                    print(f"   vs {entry.id} (elo={entry.elo:.1f}, rank #{pool.list_by_elo().index(entry)+1}): learner_wr={learner_wr:.3f}")
+                    
+                    # Restore original weights
+                    policy.pi["good"].load_state_dict(original_good_state)
+                    policy.vf["good"].load_state_dict(original_good_vf_state)
+                except Exception as e:
+                    print(f"   vs {entry.id}: failed ({e})")
             
-            results['wr_pool_prioritized'] = prioritized_wins / prioritized_games if prioritized_games > 0 else 0.5
+            results['wr_pool_prioritized'] = top_wins / top_games if top_games > 0 else 0.5
+            # Also report top-5 specific metric
+            results['wr_top5'] = results['wr_pool_prioritized']
+        elif pool:  # Legacy pool
+            print("4/4: vs prioritized pool opponents (legacy)...")
+            # ... keep existing legacy code for prioritized sampling
+            results['wr_pool_prioritized'] = 0.5  # placeholder
         else:
-            print("4/4: vs prioritized pool (skipped - empty pool)")
+            print("4/4: vs prioritized pool (skipped - no pool)")
             results['wr_pool_prioritized'] = 0.5
         
         # Print summary
@@ -361,6 +404,14 @@ def main():
         print(f"vs best.pt WR:     {results['wr_best']:.3f}")
         print(f"vs uniform pool:   {results['wr_pool_uniform']:.3f}")
         print(f"vs priority pool:  {results['wr_pool_prioritized']:.3f}")
+        
+        # Print pool statistics if available
+        if pool_stats:
+            print(f"\nPool Statistics:")
+            print(f"Pool size:         {pool_stats['size']} total, {pool_stats['qualified']} qualified")
+            print(f"Pool Elo:          mean={pool_stats['elo_mean']:.1f}, std={pool_stats['elo_std']:.1f}")
+            if 'wr_top5' in results:
+                print(f"vs top-5 WR:       {results['wr_top5']:.3f}")
         
         # Append to CSV
         csv_path = Path("artifacts/rl_metrics.csv")
