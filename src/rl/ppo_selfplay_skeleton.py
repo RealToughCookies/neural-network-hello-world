@@ -4,13 +4,14 @@ Uses adapter-native rollout collection for multi-agent environments.
 """
 
 import argparse
+import csv
+import os
 import random
+import signal
+import tempfile
 import numpy as np
 import torch
 import torch.nn as nn
-import os
-import csv
-import tempfile
 from pathlib import Path
 
 # Import new modules
@@ -1355,7 +1356,8 @@ def main():
     parser.add_argument('--eval-every', type=int, default=1, help='Evaluate every N updates')
     parser.add_argument('--eval-eps', type=int, default=4, help='Episodes for evaluation')
     parser.add_argument('--save-dir', default='artifacts/rl_ckpts', help='Checkpoint directory')
-    parser.add_argument('--resume', default='', help='Resume from checkpoint (path, "best", or "last")')
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Path to v3 bundle file or directory containing last.pt')
     parser.add_argument('--updates', type=int, default=10, help='Number of PPO updates')
     
     # Opponent pool arguments
@@ -1496,75 +1498,85 @@ def main():
         pool = OpponentPool(env=args.env, obs_dims=obs_dims)
         print(f"Created new opponent pool for env={args.env}, obs_dims={obs_dims}")
     
-    # Checkpoint and resume logic
-    start_update = 0
-    best_score = float('-inf')
+    # Create MultiHeadPolicy and per-role optimizers/schedulers
+    policy = MultiHeadPolicy(obs_dims, N_ACT)
+    from src.rl.checkpoint import save_bundle, load_bundle, save_checkpoint
+    
+    roles_set = sorted(set(roles.values()))  # e.g., ["adv", "good"]
+    
+    # Create per-role optimizers/schedulers
+    opt = {r: torch.optim.Adam(
+        list(policy.pi[r].parameters()) + list(policy.vf[r].parameters()), 
+        lr=args.lr
+    ) for r in roles_set}
+    sched = {}  # optional: fill if you have LR schedules
+    
+    global_step = 0
+    updates_done = 0
     
     if args.resume:
-        resume_path = args.resume
-        if resume_path in ["best", "last"]:
-            resume_path = f"{args.save_dir}/{resume_path}.pt"
+        bundle_path = args.resume
+        if os.path.isdir(bundle_path):
+            bundle_path = os.path.join(bundle_path, "last.pt")
+        print(f"[resume] loading {bundle_path}")
         
-        resume_path_obj = _absdir(resume_path)
-        if resume_path_obj.exists():
-            try:
-                # STRICT: Load checkpoint using checkpoint dimensions only
-                ckpt, pi_good, vf_good, pi_adv, vf_adv, adapters = _load_rl_ckpt_strict(
-                    str(resume_path_obj), adapter, allow_dim_adapter=args.allow_dim_adapter)
-                start_update = ckpt.get("step", 0)
-                
-                # Create optimizer after networks are loaded
-                optimizer = torch.optim.Adam(
-                    list(pi_good.parameters()) + list(vf_good.parameters()) +
-                    list(pi_adv.parameters()) + list(vf_adv.parameters()), 
-                    lr=3e-4
-                )
-                if "optimizer" in ckpt:
-                    optimizer.load_state_dict(ckpt["optimizer"])
-                
-                # Restore opponent pool
-                if "pool" in ckpt:
-                    pool._items = []
-                    for item in ckpt["pool"]:
-                        from src.rl.selfplay import OpponentSnapshot
-                        snap = OpponentSnapshot(item["pi_good"], item["pi_adv"])
-                        pool._items.append(snap)
-                
-                print(f"Resumed from checkpoint: {resume_path_obj} (update {start_update})")
-            except Exception as e:
-                print(f"Failed to load checkpoint {resume_path_obj}: {e}")
-                print("Creating new networks from environment dimensions")
-                # Create new networks from environment dimensions
-                pi_good = PolicyHead(obs_dims["good"], n_act=N_ACT)
-                vf_good = ValueHead(obs_dims["good"])
-                pi_adv = PolicyHead(obs_dims["adv"], n_act=N_ACT) 
-                vf_adv = ValueHead(obs_dims["adv"])
-                
-                optimizer = torch.optim.Adam(
-                    list(pi_good.parameters()) + list(vf_good.parameters()) +
-                    list(pi_adv.parameters()) + list(vf_adv.parameters()), 
-                    lr=3e-4
-                )
-        else:
-            print(f"Checkpoint not found: {resume_path_obj}")
-            print("Creating new networks from environment dimensions")
-            # Create new networks from environment dimensions
-            pi_good = PolicyHead(obs_dims["good"], n_act=N_ACT)
-            vf_good = ValueHead(obs_dims["good"])
-            pi_adv = PolicyHead(obs_dims["adv"], n_act=N_ACT) 
-            vf_adv = ValueHead(obs_dims["adv"])
+        try:
+            b = load_bundle(bundle_path)
             
-            optimizer = torch.optim.Adam(
-                list(pi_good.parameters()) + list(vf_good.parameters()) +
-                list(pi_adv.parameters()) + list(vf_adv.parameters()), 
-                lr=3e-4
-            )
-    else:
-        # Create MultiHeadPolicy for unified training
-        policy = MultiHeadPolicy(obs_dims, N_ACT)
-        
-        # No need for a single optimizer - per-role optimizers will be created in PPO loop
-        # This keeps learning rates and schedules separate per role
+            # dims/env sanity check
+            b_dims = b["meta"]["obs_dims"]
+            b_env = b["meta"]["env"]
+            assert b_env == args.env, f"resume env {b_env} != {args.env}"
+            for r in b_dims: 
+                assert b_dims[r] == obs_dims[r], f"resume dims mismatch for {r}"
+            
+            # model
+            policy.load_state_dict(b["model"])
+            
+            # optim/sched
+            for r in roles_set:
+                opt[r].load_state_dict(b["optim"][r])
+                if b["sched"].get(r): 
+                    sched[r].load_state_dict(b["sched"][r])
+            
+            # norms
+            if "norm" in b["meta"]:
+                for r in roles_set: 
+                    norms[r].load_state_dict(b["meta"]["norm"][r])
+            
+            # rng
+            torch.set_rng_state(b["rng"]["torch"])
+            np.random.set_state(b["rng"]["numpy"])
+            random.setstate(b["rng"]["python"])
+            
+            # counters
+            global_step = int(b["meta"].get("global_step", 0))
+            updates_done = int(b["meta"].get("updates", 0))
+            print(f"[resume] step={global_step} updates={updates_done}")
+            
+        except Exception as e:
+            print(f"Failed to resume from bundle {bundle_path}: {e}")
+            print("Starting fresh training")
+    
+    # SIGINT/SIGTERM safe-save handlers
+    import functools
+    
+    def _on_interrupt(signum, frame):
+        intr = save_dir / "interrupted.pt"
+        current_meta = {
+            "env": args.env,
+            "obs_dims": obs_dims,
+            "seed": args.seed,
+            "global_step": global_step,
+            "updates": updates_done,
+            "pool_path": args.pool_path,
+        }
+        save_bundle(intr, policy, opt, sched, current_meta, norms, args)
+        print(f"[ckpt v3] wrote {intr} (interrupt)")
+        raise SystemExit(130)
+    
+    for s in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(s, _on_interrupt)
     
     # Create opponent copies (always use environment dimensions for these)
     pi_good_opp = PolicyHead(obs_dims["good"], n_act=N_ACT)
@@ -1664,9 +1676,10 @@ def main():
             
             rb = _role_batch_view(batch, r)
             
-            # Create optimizer for THIS role's params only
-            params = list(policy.pi[r].parameters()) + list(policy.vf[r].parameters())
-            role_optimizer = torch.optim.Adam(params, lr=current_lr)
+            # Use persistent role optimizer with updated learning rate
+            role_optimizer = opt[r]
+            for g in role_optimizer.param_groups:
+                g["lr"] = current_lr
             
             try:
                 pi_loss, vf_loss, kl, entropy = ppo_update(
@@ -1707,13 +1720,32 @@ def main():
         _append_csv("artifacts/rl_metrics.csv", CSV_HEADER, row)
         print(f"[csv] logged to rl_metrics.csv")
         
-        # Save checkpoints atomically using trained policy (already a MultiHeadPolicy)
-        # Policy and value functions are already trained in-place
+        # Update counters
+        updates_done = update_idx + 1
+        global_step += args.rollout_steps * len(roles_set)  # rough estimate
         
-        meta = {"obs_dims": obs_dims, "schema": "v2-roles",
-                "norm": {r: norms[r].state_dict() for r in norms}}
-        save_checkpoint(policy, meta, last_path)
-        print(f"[ckpt v2] wrote {last_path}")
+        # Save checkpoints atomically
+        save_dir = Path(args.save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        last_bundle = save_dir / "last.pt"
+        last_model = save_dir / "last_model.pt"
+        
+        meta = {
+            "env": args.env,
+            "obs_dims": obs_dims,
+            "seed": args.seed,
+            "global_step": global_step,
+            "updates": updates_done,
+            "pool_path": getattr(args, "pool_path", None),
+        }
+        
+        # v3 bundle (model + optim + sched + norms + RNG + args)
+        save_bundle(last_bundle, policy, opt, sched, meta, norms, args)
+        print(f"[ckpt v3] wrote {last_bundle}")
+        
+        # v2 model-only (for eval_cli)
+        save_checkpoint(policy, {"obs_dims": obs_dims, "schema": "v2-roles"}, last_model)
+        print(f"[ckpt v2] wrote {last_model}")
         
         # Evaluation gating for opponent pool and best checkpoint
         # Run simplified eval for gating (compute win rates)
@@ -1722,17 +1754,26 @@ def main():
         
         # Gate best checkpoint update
         if wr_self >= args.gate_best_min_wr:
-            # Copy last.pt -> best.pt
-            import shutil
-            shutil.copy2(last_path, best_path)
-            print(f"[gate] copied last.pt -> best.pt (wr_self={wr_self:.3f} >= {args.gate_best_min_wr})")
+            # Save best bundle and model-only versions
+            best_bundle = save_dir / "best.pt"  
+            best_model = save_dir / "best_model.pt"
+            
+            # v3 bundle (complete state)
+            save_bundle(best_bundle, policy, opt, sched, meta, norms, args)
+            print(f"[ckpt v3] wrote {best_bundle}")
+            
+            # v2 model-only (for eval_cli)
+            save_checkpoint(policy, {"obs_dims": obs_dims, "schema": "v2-roles"}, best_model)
+            print(f"[ckpt v2] wrote {best_model}")
+            
+            print(f"[gate] saved best checkpoints (wr_self={wr_self:.3f} >= {args.gate_best_min_wr})")
             best_score = float('inf')  # mark as updated
         
-        # Gate opponent pool addition
+        # Gate opponent pool addition - use model-only checkpoint for pool
         if wr_uniform >= args.gate_pool_min_wr:
             # Determine opponent role (opposite of learner)
             opp_role = "adv"  # assuming learner is typically "good"
-            entry_id = pool.add_entry(str(last_path), role=opp_role, step=int(update_idx + 1))
+            entry_id = pool.add_entry(str(last_model), role=opp_role, step=int(update_idx + 1))
             print(f"[gate] added to pool: {entry_id} (wr_uniform={wr_uniform:.3f} >= {args.gate_pool_min_wr})")
         
         # Prune and save pool

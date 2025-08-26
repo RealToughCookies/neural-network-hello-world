@@ -138,3 +138,58 @@ def load_policy_from_ckpt(model, ckpt: str | Path | dict, expect_dims: Dict[str,
 def load_legacy_checkpoint(path: str | Path) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
     ck = torch.load(path, map_location="cpu", weights_only=False)
     return _normalize_ckpt_obj(ck)
+
+
+# ---------- v3 training bundle system ----------
+
+import time
+import json
+import random
+import numpy as np
+import subprocess
+
+def _git_meta():
+    """Extract git metadata for reproducibility tracking."""
+    try:
+        sha = subprocess.check_output(["git","rev-parse","--short","HEAD"]).decode().strip()
+        dirty = subprocess.call(["git","diff","--quiet"]) != 0
+        return {"commit": sha, "dirty": bool(dirty)}
+    except Exception:
+        return {"commit":"unknown","dirty":False}
+
+def save_bundle(path, model, optim_by_role, sched_by_role, meta, norms, args):
+    """Save complete training state bundle with reproducibility metadata."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    
+    obj = {
+        "schema": "v3-train-bundle",
+        "when": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "git": _git_meta(),
+        "meta": {
+            **meta,
+            "args": vars(args),
+            "norm": {r: norms[r].state_dict() for r in norms}
+        },
+        "model": model.state_dict(),
+        "optim": {r: optim_by_role[r].state_dict() for r in optim_by_role},
+        "sched": {r: (sched_by_role[r].state_dict() if sched_by_role and r in sched_by_role else None)
+                  for r in optim_by_role},
+        "rng": {
+            "torch": torch.get_rng_state(),
+            "numpy": np.random.get_state(),
+            "python": random.getstate(),
+        }
+    }
+    
+    # Atomic save
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(obj, tmp)
+    tmp.replace(path)
+
+def load_bundle(path):
+    """Load v3 training bundle with validation."""
+    obj = torch.load(path, map_location="cpu")
+    if obj.get("schema") != "v3-train-bundle":
+        raise RuntimeError("Not a v3-train-bundle")
+    return obj

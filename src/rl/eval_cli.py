@@ -110,8 +110,29 @@ def main():
     if not args.ckpt:
         parser.error("the following arguments are required: --ckpt")
     
-    # Resolve checkpoint path
+    # Resolve checkpoint path with directory support
     ckpt_path = Path(args.ckpt).expanduser().resolve(strict=False)
+    
+    # If directory provided, auto-select appropriate checkpoint file
+    if ckpt_path.exists() and ckpt_path.is_dir():
+        # Prefer last_model.pt for eval compatibility, fallback to last.pt
+        candidates = ["last_model.pt", "last.pt", "best_model.pt", "best.pt"]
+        selected = None
+        for candidate in candidates:
+            candidate_path = ckpt_path / candidate
+            if candidate_path.exists():
+                selected = candidate_path
+                break
+        
+        if selected:
+            print(f"Directory provided, auto-selected: {selected.name}")
+            ckpt_path = selected
+        else:
+            available = ", ".join(sorted(p.name for p in ckpt_path.glob("*.pt")))
+            if not available:
+                available = "<no .pt files>"
+            raise SystemExit(f"No suitable checkpoint found in directory: {ckpt_path}\nAvailable: {available}")
+    
     print(f"Evaluating checkpoint: {ckpt_path}")
     print(f"Environment: {args.env}, Episodes: {args.episodes}")
     
@@ -170,7 +191,14 @@ def main():
     # Load checkpoint
     norms = {}  # Initialize empty norms dict
     try:
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)  # trusted local file
+        obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)  # trusted local file
+        
+        # Handle v3 bundle compatibility
+        if isinstance(obj, dict) and obj.get("schema") == "v3-train-bundle":
+            print("Loading v3 training bundle...")
+            ckpt = {"model": obj["model"], "meta": obj["meta"]}
+        else:
+            ckpt = obj
         
         # STRICT: Get dimensions from checkpoint metadata only
         saved_dims = ckpt.get("meta", {}).get("obs_dims")
@@ -204,8 +232,16 @@ def main():
         
         # Check checkpoint format and schema
         try:
-            sd, meta = load_legacy_checkpoint(ckpt_path)
-            schema = meta.get("schema", "unknown")
+            if isinstance(obj, dict) and obj.get("schema") == "v3-train-bundle":
+                # v3 bundle - extract model state dict
+                sd = obj["model"] 
+                meta = obj["meta"]
+                schema = "v3-train-bundle"
+            else:
+                # Regular checkpoint - use legacy loader
+                sd, meta = load_legacy_checkpoint(ckpt_path)
+                schema = meta.get("schema", "unknown")
+                
             print(f"schema: {schema}")
             
             # Validate role structure
@@ -214,7 +250,12 @@ def main():
                 raise SystemExit("[fatal] legacy checkpoint without role labels. Re-train a new checkpoint after the v2-roles patch.")
             
             # Load checkpoint using robust policy loading
-            saved_dims = load_policy_from_ckpt(policy, ckpt, expect_dims=saved_dims)
+            if schema == "v3-train-bundle":
+                # Direct state dict loading for v3 bundles
+                policy.load_state_dict(sd)
+                saved_dims = meta["obs_dims"]
+            else:
+                saved_dims = load_policy_from_ckpt(policy, ckpt, expect_dims=saved_dims)
             print(f"[policy dims] using ckpt dims: good={saved_dims['good']} adv={saved_dims['adv']}")
             
             # Load frozen normalizers if available
