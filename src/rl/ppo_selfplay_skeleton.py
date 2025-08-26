@@ -23,6 +23,22 @@ import src.rl.adapters  # Import to register adapters
 N_ACT = 5  # Simple Adversary discrete actions: no-op, left, right, down, up
 
 
+def make_env_adapter(env_name: str, seed: int):
+    """Create environment adapter with consistent setup and role extraction."""
+    adapter = make_adapter(env_name)
+    # one reset up front (so dims/roles are ready)
+    ts = adapter.reset(seed=seed)
+    roles = adapter.roles()
+    obs_dims = adapter.obs_dims()
+    n_actions = adapter.n_actions()
+    agents = adapter.agent_names()
+    print("[roles]", roles)
+    print("[obs_dims]", obs_dims)
+    print("[n_actions]", n_actions)
+    print("[agents]", agents)
+    return adapter, roles, obs_dims, n_actions, agents
+
+
 def _absdir(p: str) -> Path:
     """Convert string path to resolved absolute Path object."""
     return Path(p).expanduser().resolve()
@@ -207,59 +223,6 @@ class MockEnvironment:
         return obs, reward, done, info
 
 
-def load_environment(env_name, seed=0):
-    """Load environment with fallback support."""
-    if env_name == "grf":
-        try:
-            import gfootball.env as football_env
-            env = football_env.create_environment(
-                env_name='11_vs_11_stochastic',
-                representation='simple115',
-                number_of_left_players_agent_controls=1,
-                number_of_right_players_agent_controls=0
-            )
-            print(f"Loaded Google Research Football environment")
-            return env
-        except ImportError:
-            print("Google Research Football not available, falling back to MPE2")
-            env_name = "mpe_adversary"
-    
-    if env_name == "mpe_adversary":
-        try:
-            from mpe2 import simple_adversary_v3 as simple_adv
-            backend = "mpe2"
-        except Exception:
-            from pettingzoo.mpe import simple_adversary_v3 as simple_adv
-            backend = "pettingzoo.mpe"
-        
-        # Prefer parallel API
-        try:
-            env = simple_adv.parallel_env(max_cycles=25)
-        except Exception:
-            env = simple_adv.env(max_cycles=25)
-        
-        try:
-            env.reset(seed=seed)
-        except Exception:
-            env.reset()
-        
-        print(f"[MPE backend] {backend}")
-        if not hasattr(env, '_logged_api'):
-            print(f"[MPE backend] {backend} API={'parallel' if hasattr(env, 'agents') else 'aec'}")
-            env._logged_api = True
-        return env
-    
-    if env_name == "pistonball":
-        try:
-            from pettingzoo.butterfly import pistonball_v6
-            env = pistonball_v6.env(n_pistons=3, time_penalty=-0.1, continuous=False, random_drop=True, random_rotate=True, ball_mass=0.75, ball_friction=0.3, ball_elasticity=1.5, max_cycles=125)
-            print(f"Loaded PettingZoo Pistonball environment")
-            return env
-        except ImportError as e:
-            print(f"PettingZoo not fully available ({e}), using mock environment")
-            return MockEnvironment()
-    
-    raise ValueError(f"Unknown environment: {env_name}")
 
 
 def _infer_n_act(env, agent_key, default=N_ACT):
@@ -524,9 +487,6 @@ def _make_batch(traj, role):
     }
 
 
-def make_env(kind="mpe_adversary", seed=0):
-    """Create environment for training (reuses load_environment logic)."""
-    return load_environment(kind, seed)
 
 
 def collect_rollout(env, policy, value_fn, steps=256):
@@ -838,11 +798,15 @@ def _load_rl_ckpt(path, pi_good, vf_good, pi_adv, vf_adv, opt=None,
 CSV_HEADER = ["step", "kl_good", "kl_adv", "entropy_good", "entropy_adv", "ret_eval_good", "ret_eval_adv", "opp_source"]
 
 
-def v2_roles_demo_train(steps=512):
+def v2_roles_demo_train(steps=512, save_dir: Path = None):
     """Demonstration of v2-roles checkpoint system with MultiHeadPolicy."""
     from src.rl.selfplay import evaluate
     from src.rl.checkpoint import save_checkpoint, load_policy_from_ckpt
     import os
+    
+    if save_dir is None:
+        save_dir = Path("artifacts/rl_ckpts")
+    save_dir.mkdir(parents=True, exist_ok=True)
     
     # Create environment adapter
     adapter = make_adapter("mpe_adversary", render_mode=None)
@@ -885,8 +849,6 @@ def v2_roles_demo_train(steps=512):
         print(f"[v2-demo] update {update_idx}, loss: {loss.item():.3f}")
     
     # Save checkpoint using v2-roles format
-    save_dir = "artifacts/rl_ckpts"
-    os.makedirs(save_dir, exist_ok=True)
     
     meta = {
         "obs_dims": obs_dims,
@@ -896,7 +858,7 @@ def v2_roles_demo_train(steps=512):
         "update_idx": 2
     }
     
-    v2_path = f"{save_dir}/v2_demo.pt"
+    v2_path = save_dir / "v2_demo.pt"
     save_checkpoint(policy, meta, v2_path)
     print(f"[v2-demo] saved v2-roles checkpoint: {v2_path}")
     
@@ -907,10 +869,14 @@ def v2_roles_demo_train(steps=512):
     print(f"[v2-demo] ✅ v2-roles demo completed successfully!")
 
 
-def selfplay_smoke_train(steps=1024):
+def selfplay_smoke_train(steps=1024, save_dir: Path = None):
     """Minimal self-play training smoke test."""
     from src.rl.selfplay import OpponentPool, Matchmaker, evaluate
     import os
+    
+    if save_dir is None:
+        save_dir = Path("artifacts/rl_ckpts")
+    save_dir.mkdir(parents=True, exist_ok=True)
     
     # Create environment adapter
     adapter = make_adapter("mpe_adversary", render_mode=None)
@@ -953,7 +919,6 @@ def selfplay_smoke_train(steps=1024):
     # Checkpoint and resume logic
     start_step = 0
     best_score = float('-inf')
-    save_dir = "artifacts/rl_ckpts"  # Default save directory
     
     # Resume from checkpoint if specified (disabled in smoke test)
     resume_path = ""  # This would come from args in main training
@@ -1045,10 +1010,9 @@ def selfplay_smoke_train(steps=1024):
         # Save checkpoints atomically
         config = {"steps": steps, "lr": 3e-4, "n_act": N_ACT}
         current_step = start_step + update_idx
-        save_dir_path = _absdir(save_dir)
         
         # Always save last checkpoint  
-        last_path = save_dir_path / "last.pt"
+        last_path = save_dir / "last.pt"
         
         # Create MultiHeadPolicy for v2-roles format (random init, no transplant)
         policy = MultiHeadPolicy(obs_dims, n_act)
@@ -1062,7 +1026,7 @@ def selfplay_smoke_train(steps=1024):
         current_score = eval_g + eval_a if 'eval_g' in locals() and 'eval_a' in locals() else 0.0
         if current_score > best_score:
             best_score = current_score
-            best_path = save_dir_path / "best.pt"
+            best_path = save_dir / "best.pt"
             save_checkpoint(policy, meta, best_path)
             print(f"[ckpt v2] wrote {best_path}")
     else:
@@ -1105,16 +1069,19 @@ def selfplay_smoke_train(steps=1024):
         return False
 
 
-def smoke_train(steps=512, env_kind="mpe_adversary", seed=0):
+def smoke_train(steps=512, env_kind="mpe_adversary", seed=0, save_dir: Path = None):
     """Minimal PPO training smoke test."""
+    if save_dir is None:
+        save_dir = Path("artifacts/rl_ckpts")
+    save_dir.mkdir(parents=True, exist_ok=True)
+    last_path = save_dir / "last.pt"
+    best_path = save_dir / "best.pt"
+    
     # Ensure CSV logging
     _ensure_artifacts()
     
-    # Create environment
-    env = make_env(env_kind, seed)
-    
-    # Get role mapping and observation dimensions
-    role_of, obs_dims = get_role_maps(env)
+    # Create environment adapter
+    adapter, role_of, obs_dims, n_actions, agents = make_env_adapter(env_kind, seed)
     
     from src.rl.ppo_core import ppo_update
     
@@ -1130,17 +1097,20 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0):
     params = list(policy.parameters()) + list(value_fn.parameters())
     optimizer = torch.optim.Adam(params, lr=3e-4)
     
-    # Determine collector type based on environment reset
-    reset_out = env.reset()
-    first_obs = reset_out[0] if isinstance(reset_out, tuple) else reset_out
+    # Determine collector type based on environment reset (already reset in make_env_adapter)
+    # Use adapter API instead of direct env calls
+    ts = adapter.reset(seed=seed)  # Reset again to get fresh state
+    first_obs = ts.obs
     is_parallel = isinstance(first_obs, dict)
     
     if is_parallel:
         print("[collector] parallel_mpe")
-        # Create role-specific heads for single-agent training
-        pi_good, vf_good = PolicyHead(10, n_act=N_ACT), ValueHead(10)
-        pi_adv, vf_adv = PolicyHead(8, n_act=N_ACT), ValueHead(8)
-        ep_rew, traj = collect_parallel_mpe(env, pi_good, pi_adv, pi_good, pi_adv, vf_good, vf_adv,
+        # Create role-specific heads using actual adapter dimensions
+        good_dim = obs_dims["good"]
+        adv_dim = obs_dims["adv"] 
+        pi_good, vf_good = PolicyHead(good_dim, n_act=n_actions), ValueHead(good_dim)
+        pi_adv, vf_adv = PolicyHead(adv_dim, n_act=n_actions), ValueHead(adv_dim)
+        ep_rew, traj = collect_parallel_adapter(adapter, pi_good, pi_adv, pi_good, pi_adv, vf_good, vf_adv,
                                            learner_role="good", steps=steps, device="cpu")
         # Convert to batch format
         if not traj:
@@ -1163,8 +1133,9 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0):
             'rets': torch.tensor(np.array(rew_list), dtype=torch.float32)
         }
     else:
-        print("[collector] single_env")
-        batch = collect_rollout(env, policy, value_fn, steps)
+        print("[collector] single_env (skipped - adapter API is multi-agent)")
+        # Legacy single-agent collection, skip for adapter API
+        return True
     
     # Get initial entropy for comparison
     with torch.no_grad():
@@ -1182,9 +1153,6 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0):
     print(f"PPO: pi={pi_loss:.3f} vf={vf_loss:.3f} kl={kl:.4f} ent={entropy:.3f}")
     
     # Save checkpoint atomically after PPO update
-    save_dir = _absdir("artifacts/rl_ckpts")
-    last_path = save_dir / "last.pt"
-    best_path = save_dir / "best.pt"
     
     # Helper for validation
     def _first_layer_in_dim(sd):
@@ -1284,7 +1252,10 @@ def main():
     print(f"[cwd] {os.getcwd()}")
     
     parser = argparse.ArgumentParser(description='PPO Self-Play Skeleton')
-    parser.add_argument('--env', choices=['grf', 'mpe_adversary', 'pistonball'], default='mpe_adversary', help='Environment')
+    parser.add_argument("--env", type=str, default="mpe_adversary",
+                        help="Environment adapter name (e.g., mpe_adversary, dota_last_hit)")
+    parser.add_argument("--list-envs", action="store_true",
+                        help="List available env adapters and exit")
     parser.add_argument('--steps', type=int, default=1000, help='Training steps')
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
     parser.add_argument('--dry-run', action='store_true', help='Test environment setup')
@@ -1321,6 +1292,20 @@ def main():
     
     args = parser.parse_args()
     
+    # Set up save directory
+    from pathlib import Path
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    last_path = save_dir / "last.pt"
+    best_path = save_dir / "best.pt"
+    print(f"[save-dir] {save_dir.resolve()}")
+    
+    # Handle list-envs option
+    from src.rl.env_api import make_adapter, _REGISTRY
+    if getattr(args, "list_envs", False):
+        print("Available adapters:", ", ".join(sorted(_REGISTRY.keys())))
+        raise SystemExit(0)
+    
     # Check PettingZoo version if requested
     if args.pin_pz124:
         try:
@@ -1339,19 +1324,12 @@ def main():
     rng = np.random.Generator(np.random.PCG64(args.seed))
     
     # Create environment adapter
-    adapter = make_adapter(args.env, render_mode=None)
-    adapter.reset(seed=args.seed)
-    
-    # Get role mapping and observation dimensions from adapter
-    role_of = adapter.roles()
-    obs_dims = adapter.obs_dims()
-    n_act = adapter.n_actions()
-    agents = adapter.agent_names()
-    
-    print(f"[roles] {role_of}")
-    print(f"[obs_dims] {obs_dims}")
-    print(f"[n_actions] {n_act}")
-    print(f"[agents] {agents}")
+    try:
+        adapter, role_of, obs_dims, n_act, agents = make_env_adapter(args.env, args.seed)
+    except ValueError as e:
+        print(e)
+        print("Tip: run with --list-envs to see registered adapters.")
+        raise SystemExit(2)
     
     if args.dry_run:
         policy = PolicyHead(10, n_act=n_act)  # Use consistent n-action head
@@ -1359,17 +1337,17 @@ def main():
         return
     
     if args.train:
-        success = smoke_train(steps=args.steps, env_kind=args.env, seed=args.seed)
+        success = smoke_train(steps=args.steps, env_kind=args.env, seed=args.seed, save_dir=save_dir)
         print(f"Smoke train {'✓ PASSED' if success else '✗ FAILED'}")
         return
     
     if args.selfplay:
-        success = selfplay_smoke_train(steps=args.steps)
+        success = selfplay_smoke_train(steps=args.steps, save_dir=save_dir)
         print(f"Self-play smoke train {'✓ PASSED' if success else '✗ FAILED'}")
         return
     
     if args.v2_roles_demo:
-        v2_roles_demo_train(steps=args.steps)
+        v2_roles_demo_train(steps=args.steps, save_dir=save_dir)
         return
     
     # Full self-play training loop with robust checkpointing
@@ -1556,9 +1534,6 @@ def main():
         print(f"[csv] logged to rl_metrics.csv")
         
         # Save checkpoints atomically (always save regardless of training success)
-        save_dir = _absdir(args.save_dir)
-        last_path = save_dir / "last.pt"
-        best_path = save_dir / "best.pt"
         
         # Helper for validation
         def _first_layer_in_dim(sd):
