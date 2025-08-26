@@ -111,14 +111,8 @@ def main():
     if not args.ckpt:
         parser.error("the following arguments are required: --ckpt")
     
-    # Resolve checkpoint path with directory support
-    path = args.ckpt
-    if os.path.isdir(path):
-        m = os.path.join(path, "last_model.pt")
-        path = m if os.path.exists(m) else os.path.join(path, "last.pt")
-        print(f"Directory provided, auto-selected: {os.path.basename(path)}")
-    
-    ckpt_path = Path(path).expanduser().resolve(strict=False)
+    # Resolve checkpoint path
+    ckpt_path = Path(args.ckpt).expanduser().resolve(strict=False)
     
     print(f"Evaluating checkpoint: {ckpt_path}")
     print(f"Environment: {args.env}, Episodes: {args.episodes}")
@@ -175,19 +169,16 @@ def main():
                 return int(v.shape[0])  # [n_act, hidden]
         return None
     
-    # Load checkpoint using new API
-    norms = {}  # Initialize empty norms dict
+    # Load checkpoint
+    norms = {}
     try:
         kind, obj = load_checkpoint_auto(ckpt_path)
         
         if kind == "v3":
             print("Loading v3 training bundle...")
-            # Extract model state and metadata from v3 bundle
             ckpt = {"model": obj["model_state"], "meta": obj["meta"]}
-            
-            # Load observation normalizers if present
+            # Load obs normalizers from v3 bundle
             if obj.get("obs_norm_state"):
-                print("Loading frozen normalizers from v3 bundle...")
                 for role, norm_state in obj["obs_norm_state"].items():
                     norms[role] = RunningNorm()
                     norms[role].load_state_dict(norm_state)
@@ -195,14 +186,11 @@ def main():
         else:
             print("Loading model-only checkpoint...")
             ckpt = obj
+            print("No normalizers found in model-only checkpoint")
         
-        # Get dimensions from checkpoint metadata
         saved_dims = ckpt.get("meta", {}).get("obs_dims")
         if saved_dims is None:
-            raise ValueError(
-                "Checkpoint missing meta.obs_dims; re-train a small ckpt with the new trainer. "
-                "This checkpoint was created before per-role dimension support was added."
-            )
+            raise ValueError("Checkpoint missing meta.obs_dims")
         
         print(f"[checkpoint obs_dims] good={saved_dims['good']}, adv={saved_dims['adv']}")
         

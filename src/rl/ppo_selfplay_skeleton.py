@@ -22,7 +22,7 @@ from src.rl.env_utils import get_role_maps
 from src.rl.models import MultiHeadPolicy, MultiHeadValue, PolicyHead, ValueHead, DimAdapter
 from src.rl.env_api import make_adapter
 from src.rl.checkpoint import save_checkpoint, load_policy_from_ckpt, load_legacy_checkpoint, save_bundle, load_bundle
-from src.rl.ckpt_io import make_bundle, save_checkpoint_v3, load_checkpoint_auto, capture_rng_state, restore_rng_state, _git_commit
+from src.rl.ckpt_io import make_bundle, save_checkpoint_v3, load_checkpoint_auto, _capture_rng, _restore_rng
 from src.rl.rollout import collect_rollouts
 import src.rl.adapters  # Import to register adapters
 
@@ -775,7 +775,7 @@ def _save_rl_ckpt(path, step, pi_good, vf_good, pi_adv, vf_adv, opt, pool, confi
     
     meta["schema"] = "v2-roles"
     save_checkpoint(policy, meta, path)
-    print(f"[ckpt v2] wrote {path}")
+    print(f"[ckpt v3] wrote {path}")
 
 
 def _load_rl_ckpt_strict(path, adapter, allow_dim_adapter=False):
@@ -1095,7 +1095,7 @@ def selfplay_smoke_train(steps=1024, save_dir: Path = None):
         
         meta = {"obs_dims": obs_dims, "schema": "v2-roles"}
         save_checkpoint(policy, meta, last_path)
-        print(f"[ckpt v2] wrote {last_path}")
+        print(f"[ckpt v3] wrote {last_path}")
         
         # Check if this is the best model based on evaluation score
         current_score = eval_g + eval_a if 'eval_g' in locals() and 'eval_a' in locals() else 0.0
@@ -1103,7 +1103,7 @@ def selfplay_smoke_train(steps=1024, save_dir: Path = None):
             best_score = current_score
             best_path = save_dir / "best.pt"
             save_checkpoint(policy, meta, best_path)
-            print(f"[ckpt v2] wrote {best_path}")
+            print(f"[ckpt v3] wrote {best_path}")
     else:
         logs = []  # Empty logs for CSV
         update_idx = start_step  # Use start_step if no training occurred
@@ -1251,9 +1251,9 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0, save_dir: Path = No
     # Save the trained policy (already a MultiHeadPolicy)
     meta = {"obs_dims": obs_dims, "schema": "v2-roles"}
     save_checkpoint(policy, meta, last_path)
-    print(f"[ckpt v2] wrote {last_path}")
+    print(f"[ckpt v3] wrote {last_path}")
     save_checkpoint(policy, meta, best_path)
-    print(f"[ckpt v2] wrote {best_path}")
+    print(f"[ckpt v3] wrote {best_path}")
     
     # Relaxed success criteria: allow reasonable KL drift and finite losses (using first role's stats)
     _ensure_artifacts()
@@ -1517,103 +1517,51 @@ def main():
     global_step = 0
     updates_done = 0
     
-    # Resume from checkpoint if requested or auto-resume if last.pt exists
-    resume_path = None
+    # Resume logic
     if args.resume:
-        resume_path = Path(args.resume)
-    elif (save_dir / "last.pt").exists():
-        resume_path = save_dir / "last.pt"
-        print(f"[auto-resume] found {resume_path}")
-        
-    if resume_path:
-        print(f"[resume] loading from {resume_path}")
-        try:
-            kind, obj = load_checkpoint_auto(resume_path)
-            
-            if kind == "v3":
-                # Full v3 bundle resume
-                # Sanity checks
-                bundle_dims = obj["meta"]["obs_dims"]
-                bundle_env = obj["meta"]["env"]
-                if bundle_env != args.env:
-                    raise ValueError(f"resume env {bundle_env} != {args.env}")
-                for r in bundle_dims:
-                    if bundle_dims[r] != obs_dims[r]:
-                        raise ValueError(f"resume dims mismatch for {r}: {bundle_dims[r]} != {obs_dims[r]}")
-                
-                # Load model
-                policy.load_state_dict(obj["model_state"])
-                
-                # Load optimizers
-                for r in roles_set:
-                    if r in obj["optim_state"]:
-                        opt[r].load_state_dict(obj["optim_state"][r])
-                
-                # Load schedulers
-                if obj.get("sched_state") and sched:
-                    for r in roles_set:
-                        if obj["sched_state"].get(r) and sched.get(r):
-                            sched[r].load_state_dict(obj["sched_state"][r])
-                
-                # Load normalizers
-                if obj.get("obs_norm_state"):
-                    for r in roles_set:
-                        if r in obj["obs_norm_state"]:
-                            norms[r].load_state_dict(obj["obs_norm_state"][r])
-                
-                # Restore RNG state
-                restore_rng_state(obj)
-                
-                # Restore counters
-                global_step = obj["counters"].get("global_step", 0)
-                updates_done = obj["counters"].get("update_idx", 0)
-                
-                print(f"[resume v3] step={global_step} updates={updates_done}")
-                
-            elif kind == "model_only":
-                # Model-only resume - yellow warning
-                print("\033[93m[WARNING] Resuming from model-only checkpoint - optimizer/scheduler/RNG state will be fresh\033[0m")
-                
-                # Load only model state
-                if "model" in obj:
-                    policy.load_state_dict(obj["model"])
-                else:
-                    policy.load_state_dict(obj)
-                    
-                print("[resume model-only] loaded model weights only")
-                
-        except Exception as e:
-            print(f"Failed to resume from {resume_path}: {e}")
-            print("Starting fresh training")
+        kind, obj = load_checkpoint_auto(Path(args.resume), map_location="cpu")
+        if kind == "v3":
+            b = obj
+            policy.load_state_dict(b["model_state"])
+            for r in opt:
+                opt[r].load_state_dict(b["optim_state"][r])
+            if sched and b.get("sched_state") is not None:
+                for r in sched:
+                    if b["sched_state"].get(r):
+                        sched[r].load_state_dict(b["sched_state"][r])
+            if b.get("obs_norm_state"):
+                for r, sd in b["obs_norm_state"].items(): 
+                    norms[r].load_state_dict(sd)
+            if b.get("adv_norm_state") and 'adv_norm' in locals():
+                adv_norm.load_state_dict(b["adv_norm_state"])
+            _restore_rng(b["rng_state"])
+            global_step = b["counters"].get("global_step", 0)
+            updates_done = b["counters"].get("update_idx", 0)
+            current_lr = 3e-4  # default lr
+            print(f"loaded ckpt v3: step={global_step} updates={updates_done} lr={current_lr} seed={b['meta'].get('seed')} env={b['meta'].get('env')}")
+        else:
+            if "model" in obj:
+                policy.load_state_dict(obj["model"])
+            else:
+                policy.load_state_dict(obj)
+            print("resumed model-only checkpoint (no optimizer/scheduler/normalizers/RNG).")
     
     # SIGINT/SIGTERM safe-save handlers
     import functools
     
     def _on_interrupt(signum, frame):
-        # Create interrupt bundle with current state
         intr_bundle = make_bundle(
             version=3,
             model_state=policy.state_dict(),
             optim_state={r: opt[r].state_dict() for r in opt},
             sched_state={r: sched[r].state_dict() for r in sched} if sched else None,
-            obs_norm_state={r: norms[r].state_dict() for r in norms},
+            obs_norm_state={r: norms[r].state_dict() for r in norms} if norms else None,
             adv_norm_state=None,
-            rng_state=capture_rng_state(),
-            counters={
-                "global_step": global_step,
-                "update_idx": updates_done,
-                "episodes": updates_done
-            },
-            meta={
-                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "env": args.env,
-                "adapter": args.env,
-                "git_commit": _git_commit(),
-                "seed": args.seed,
-                "obs_dims": obs_dims
-            }
+            rng_state=_capture_rng(),
+            counters={"global_step": global_step, "update_idx": updates_done, "episodes": updates_done},
+            meta={"created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "env": args.env, "adapter": args.env, "seed": args.seed}
         )
-        # Save interrupt bundle  
         intr_path = save_dir / "interrupted.pt"
         torch.save(intr_bundle, intr_path)
         print(f"[ckpt v3] wrote {intr_path.name} (interrupt)")
@@ -1768,40 +1716,23 @@ def main():
         updates_done = update_idx + 1
         global_step += args.rollout_steps * len(roles_set)  # rough estimate
         
-        # Save checkpoints atomically
+        # Save checkpoints
         save_dir = Path(args.save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        last_bundle = save_dir / "last.pt"
-        last_model = save_dir / "last_model.pt"
         
-        # Create v3 bundle with new API
         bundle = make_bundle(
             version=3,
             model_state=policy.state_dict(),
             optim_state={r: opt[r].state_dict() for r in opt},
             sched_state={r: sched[r].state_dict() for r in sched} if sched else None,
-            obs_norm_state={r: norms[r].state_dict() for r in norms},
-            adv_norm_state=None,  # No advantage normalizer in current setup
-            rng_state=capture_rng_state(),
-            counters={
-                "global_step": global_step,
-                "update_idx": updates_done, 
-                "episodes": updates_done  # Rough proxy
-            },
-            meta={
-                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "env": args.env,
-                "adapter": args.env,
-                "git_commit": _git_commit(),
-                "seed": args.seed,
-                "obs_dims": obs_dims
-            }
+            obs_norm_state={r: norms[r].state_dict() for r in norms} if norms else None,
+            adv_norm_state=None,
+            rng_state=_capture_rng(),
+            counters={"global_step": global_step, "update_idx": updates_done, "episodes": updates_done},
+            meta={"created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "env": args.env, "adapter": args.env, "seed": args.seed}
         )
-        
-        # Atomically save v3 bundle and model-only checkpoint
-        bundle_path, model_path = save_checkpoint_v3(bundle, save_dir)
-        print(f"[ckpt v3] saved {bundle_path.name}")
-        print(f"[ckpt v2] saved {model_path.name}")
+        save_checkpoint_v3(bundle, save_dir)
+        print("ckpt v3 → last.pt (bundle), last_model.pt (weights-only)")
         
         # Evaluation gating for opponent pool and best checkpoint
         # Run simplified eval for gating (compute win rates)
@@ -1821,7 +1752,7 @@ def main():
         if wr_uniform >= args.gate_pool_min_wr:
             # Determine opponent role (opposite of learner)
             opp_role = "adv"  # assuming learner is typically "good"
-            entry_id = pool.add_entry(str(last_model), role=opp_role, step=int(update_idx + 1))
+            entry_id = pool.add_entry(str(save_dir / "last_model.pt"), role=opp_role, step=int(update_idx + 1))
             print(f"[gate] added to pool: {entry_id} (wr_uniform={wr_uniform:.3f} >= {args.gate_pool_min_wr})")
         
         # Prune and save pool
