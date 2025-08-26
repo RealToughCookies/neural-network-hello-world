@@ -107,7 +107,7 @@ def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
 
 
 def ppo_update(policy, value_fn, optimizer, batch, clip=0.2, vf_coef=0.5, ent_coef=0.01, 
-               epochs=4, minibatch_size=64, target_kl=0.03):
+               epochs=4, minibatch_size=64, target_kl=0.03, max_grad_norm=0.5):
     """PPO update with clipped policy loss and value function loss."""
     
     obs, acts, logps_old, advs, rets, vals_old = (
@@ -163,7 +163,7 @@ def ppo_update(policy, value_fn, optimizer, batch, clip=0.2, vf_coef=0.5, ent_co
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
-                list(policy.parameters()) + list(value_fn.parameters()), 0.5
+                list(policy.parameters()) + list(value_fn.parameters()), max_grad_norm
             )
             optimizer.step()
             

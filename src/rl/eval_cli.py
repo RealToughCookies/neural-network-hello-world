@@ -8,6 +8,7 @@ import torch
 import sys
 import os
 from pathlib import Path
+import math
 
 # Add src to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -16,10 +17,22 @@ from src.rl.ppo_selfplay_skeleton import PolicyHead, ValueHead, N_ACT
 from src.rl.env_api import make_adapter
 from src.rl.models import MultiHeadPolicy, DimAdapter
 from src.rl.checkpoint import load_policy_from_ckpt, load_legacy_checkpoint
+from src.rl.normalizer import RunningNorm
 import src.rl.adapters  # Import to register adapters
 
 
-def run_episodes(policy, adapter, agents, roles, episodes: int, seed: int, deterministic: bool = True, adapters=None):
+def wilson(p, n, z=1.96):
+    """Wilson 95% confidence interval for binomial proportion."""
+    if n == 0:
+        return p, 0.0, 1.0
+    z_sq = z * z
+    denominator = 1 + z_sq / n
+    center = (p + z_sq / (2 * n)) / denominator
+    margin = z * math.sqrt((p * (1 - p) + z_sq / (4 * n)) / n) / denominator
+    return center, max(0.0, center - margin), min(1.0, center + margin)
+
+
+def run_episodes(policy, adapter, agents, roles, episodes: int, seed: int, deterministic: bool = True, adapters=None, norms=None):
     """Run episodes using adapter API and return win rate for learner (good) side."""
     import numpy as np
     import torch
@@ -36,6 +49,11 @@ def run_episodes(policy, adapter, agents, roles, episodes: int, seed: int, deter
             for agent in agents:
                 role = roles[agent]
                 obs_np = ts.obs[agent]
+                
+                # Apply frozen normalization if available
+                if norms and role in norms:
+                    obs_np = norms[role].transform(obs_np)
+                
                 obs = torch.tensor(obs_np, dtype=torch.float32).unsqueeze(0)
                 
                 # Apply dimension adapter if needed
@@ -150,6 +168,7 @@ def main():
         return None
     
     # Load checkpoint
+    norms = {}  # Initialize empty norms dict
     try:
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)  # trusted local file
         
@@ -197,6 +216,17 @@ def main():
             # Load checkpoint using robust policy loading
             saved_dims = load_policy_from_ckpt(policy, ckpt, expect_dims=saved_dims)
             print(f"[policy dims] using ckpt dims: good={saved_dims['good']} adv={saved_dims['adv']}")
+            
+            # Load frozen normalizers if available
+            norm_meta = meta.get('norm')
+            if norm_meta:
+                print("Loading frozen normalizers from checkpoint...")
+                for role, norm_state in norm_meta.items():
+                    norms[role] = RunningNorm()
+                    norms[role].load_state_dict(norm_state)
+                    print(f"  {role}: count={norms[role].count:.0f}, mean_norm={abs(norms[role].mean).mean() if norms[role].mean is not None else 0:.3f}")
+            else:
+                print("No normalizers found in checkpoint metadata")
             
         except Exception as e:
             print(f"Checkpoint loading failed: {e}")
@@ -271,8 +301,10 @@ def main():
         
         # 1. Self-play (mirror match)
         print("1/4: Self vs self mirror...")
-        results['wr_self'] = run_episodes(policy, adapter, agents, roles, episodes=args.episodes // 4, seed=args.seed, adapters=adapters)
-        print(f"   Self-play win rate: {results['wr_self']:.3f}")
+        wins = args.episodes // 4
+        results['wr_self'] = run_episodes(policy, adapter, agents, roles, episodes=wins, seed=args.seed, adapters=adapters, norms=norms)
+        center, lower, upper = wilson(results['wr_self'], wins)
+        print(f"   Self-play win rate: {results['wr_self']:.3f} (95% CI: [{lower:.3f}, {upper:.3f}])")
         
         # 2. vs best.pt if exists
         best_path = ckpt_path.parent / "best.pt"
@@ -290,9 +322,11 @@ def main():
                 policy.vf["good"].load_state_dict(opp_policy.vf["good"].state_dict())
                 
                 # Run evaluation (win rate from good perspective, so 1-wr = learner adv win rate)
-                wr = run_episodes(policy, adapter, agents, roles, episodes=args.episodes // 4, seed=args.seed + 1000, adapters=adapters)
+                episodes_best = args.episodes // 4
+                wr = run_episodes(policy, adapter, agents, roles, episodes=episodes_best, seed=args.seed + 1000, adapters=adapters, norms=norms)
                 results['wr_best'] = 1.0 - wr  # Learner (adv) wins when good loses
-                print(f"   vs best.pt: learner_wr={results['wr_best']:.3f}")
+                center, lower, upper = wilson(results['wr_best'], episodes_best)
+                print(f"   vs best.pt: learner_wr={results['wr_best']:.3f} (95% CI: [{lower:.3f}, {upper:.3f}])")
                 
                 # Restore original weights
                 policy.pi["good"].load_state_dict(original_good_state)
@@ -329,12 +363,13 @@ def main():
                         policy.pi["good"].load_state_dict(opp_policy.pi["good"].state_dict())
                         policy.vf["good"].load_state_dict(opp_policy.vf["good"].state_dict())
                     
-                    wr = run_episodes(policy, adapter, agents, roles, episodes=episodes_per_opponent, seed=args.seed + uniform_games + 2000, adapters=adapters)
+                    wr = run_episodes(policy, adapter, agents, roles, episodes=episodes_per_opponent, seed=args.seed + uniform_games + 2000, adapters=adapters, norms=norms)
                     learner_wr = 1.0 - wr if entry.role == "good" else wr
                     if learner_wr > 0.5:
                         uniform_wins += 1
                     uniform_games += 1
-                    print(f"   vs {entry.id} (elo={entry.elo:.1f}): learner_wr={learner_wr:.3f}")
+                    center, lower, upper = wilson(learner_wr, episodes_per_opponent)
+                    print(f"   vs {entry.id} (elo={entry.elo:.1f}): learner_wr={learner_wr:.3f} (95% CI: [{lower:.3f}, {upper:.3f}])")
                     
                     # Restore original weights
                     policy.pi["good"].load_state_dict(original_good_state)
@@ -374,12 +409,13 @@ def main():
                         policy.pi["good"].load_state_dict(opp_policy.pi["good"].state_dict())
                         policy.vf["good"].load_state_dict(opp_policy.vf["good"].state_dict())
                     
-                    wr = run_episodes(policy, adapter, agents, roles, episodes=episodes_per_opponent, seed=args.seed + top_games + 3000, adapters=adapters)
+                    wr = run_episodes(policy, adapter, agents, roles, episodes=episodes_per_opponent, seed=args.seed + top_games + 3000, adapters=adapters, norms=norms)
                     learner_wr = 1.0 - wr if entry.role == "good" else wr
                     if learner_wr > 0.5:
                         top_wins += 1
                     top_games += 1
-                    print(f"   vs {entry.id} (elo={entry.elo:.1f}, rank #{pool.list_by_elo().index(entry)+1}): learner_wr={learner_wr:.3f}")
+                    center, lower, upper = wilson(learner_wr, episodes_per_opponent)
+                    print(f"   vs {entry.id} (elo={entry.elo:.1f}, rank #{pool.list_by_elo().index(entry)+1}): learner_wr={learner_wr:.3f} (95% CI: [{lower:.3f}, {upper:.3f}])")
                     
                     # Restore original weights
                     policy.pi["good"].load_state_dict(original_good_state)
@@ -398,12 +434,22 @@ def main():
             print("4/4: vs prioritized pool (skipped - no pool)")
             results['wr_pool_prioritized'] = 0.5
         
-        # Print summary
+        # Print summary with Wilson CIs
         print(f"\nEvaluation Results Summary:")
-        print(f"Self-play WR:      {results['wr_self']:.3f}")
-        print(f"vs best.pt WR:     {results['wr_best']:.3f}")
-        print(f"vs uniform pool:   {results['wr_pool_uniform']:.3f}")
-        print(f"vs priority pool:  {results['wr_pool_prioritized']:.3f}")
+        episodes_per_test = args.episodes // 4
+        
+        center, lower, upper = wilson(results['wr_self'], episodes_per_test)
+        print(f"Self-play WR:      {results['wr_self']:.3f} (95% CI: [{lower:.3f}, {upper:.3f}])")
+        
+        center, lower, upper = wilson(results['wr_best'], episodes_per_test)
+        print(f"vs best.pt WR:     {results['wr_best']:.3f} (95% CI: [{lower:.3f}, {upper:.3f}])")
+        
+        # For pool results, estimate episodes based on number of opponents faced
+        center, lower, upper = wilson(results['wr_pool_uniform'], episodes_per_test)
+        print(f"vs uniform pool:   {results['wr_pool_uniform']:.3f} (95% CI: [{lower:.3f}, {upper:.3f}])")
+        
+        center, lower, upper = wilson(results['wr_pool_prioritized'], episodes_per_test)
+        print(f"vs priority pool:  {results['wr_pool_prioritized']:.3f} (95% CI: [{lower:.3f}, {upper:.3f}])")
         
         # Print pool statistics if available
         if pool_stats:

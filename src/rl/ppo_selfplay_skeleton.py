@@ -303,7 +303,7 @@ def _act_for_keys(keys, obs_dict, pi_good, pi_adv, device="cpu"):
     return out
 
 
-def collect_parallel_adapter(adapter, pi_good_l, pi_adv_l, pi_good_o, pi_adv_o, vf_good, vf_adv, learner_role="good", steps=512, device="cpu", curriculum_level=None):
+def collect_parallel_adapter(adapter, pi_good_l, pi_adv_l, pi_good_o, pi_adv_o, vf_good, vf_adv, learner_role="good", steps=512, device="cpu", curriculum_level=None, norms=None, obs_norm=False):
     """Collect per-agent trajectories from environment adapter with role-specific heads."""
     import torch
     import numpy as np
@@ -325,6 +325,17 @@ def collect_parallel_adapter(adapter, pi_good_l, pi_adv_l, pi_good_o, pi_adv_o, 
     
     while t < steps:
         obs = ts.obs
+        
+        # Apply observation normalization
+        if obs_norm and norms:
+            normalized_obs = {}
+            for agent_name, raw_obs in obs.items():
+                role = role_of[agent_name]
+                # Update normalizer
+                norms[role].update(raw_obs)
+                # Transform observation
+                normalized_obs[agent_name] = norms[role].transform(raw_obs)
+            obs = normalized_obs
         
         # Split agents by role
         good_agents = [name for name, role in role_of.items() if role == "good"]
@@ -1002,7 +1013,7 @@ def selfplay_smoke_train(steps=1024, save_dir: Path = None):
     if batch_g:
         try:
             pi_g, vf_g, kl_g, ent_g = ppo_update(pi_good, vf_good, optimizer, batch_g,
-                                                 epochs=4, minibatch_size=64)
+                                                 epochs=4, minibatch_size=64, max_grad_norm=0.5)
             logs.append(("good", pi_g, vf_g, kl_g, ent_g))
         except Exception as e:
             print(f"PPO update failed for good agents: {e}")
@@ -1010,7 +1021,7 @@ def selfplay_smoke_train(steps=1024, save_dir: Path = None):
     if batch_a:
         try:
             pi_a, vf_a, kl_a, ent_a = ppo_update(pi_adv, vf_adv, optimizer, batch_a,
-                                                 epochs=4, minibatch_size=64)
+                                                 epochs=4, minibatch_size=64, max_grad_norm=0.5)
             logs.append(("adv", pi_a, vf_a, kl_a, ent_a))
         except Exception as e:
             print(f"PPO update failed for adversary agents: {e}")
@@ -1170,7 +1181,7 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0, save_dir: Path = No
     print("Running PPO update...")
     pi_loss, vf_loss, kl, entropy = ppo_update(
         policy, value_fn, optimizer, batch, 
-        epochs=4, minibatch_size=64
+        epochs=4, minibatch_size=64, max_grad_norm=0.5
     )
     
     print(f"PPO: pi={pi_loss:.3f} vf={vf_loss:.3f} kl={kl:.4f} ent={entropy:.3f}")
@@ -1325,6 +1336,34 @@ def main():
     parser.add_argument("--cur-milestones", type=str, default="0.0:0,0.33:1,0.66:2,0.85:3",
                         help='For "stairs": comma list prog:level, e.g. "0.0:0,0.5:1,0.8:2,0.9:3"')
     
+    # PPO hyperparameter arguments
+    parser.add_argument("--obs-norm", action="store_true",
+                        help="Enable observation normalization")
+    parser.add_argument("--rollout-steps", type=int, default=2048,
+                        help="Number of steps per rollout")
+    parser.add_argument("--ppo-epochs", type=int, default=4,
+                        help="Number of PPO epochs per update")
+    parser.add_argument("--minibatches", type=int, default=4,
+                        help="Number of minibatches per epoch")
+    parser.add_argument("--batch-size", type=int, default=32768,
+                        help="Total batch size")
+    parser.add_argument("--clip-range", type=float, default=0.2,
+                        help="PPO clipping range")
+    parser.add_argument("--clip-vloss", action="store_true",
+                        help="Enable value loss clipping")
+    parser.add_argument("--vf-coef", type=float, default=0.5,
+                        help="Value function coefficient")
+    parser.add_argument("--ent-coef", type=float, default=0.01,
+                        help="Entropy coefficient")
+    parser.add_argument("--target-kl", type=float, default=0.02,
+                        help="Target KL divergence for early stopping")
+    parser.add_argument("--max-grad-norm", type=float, default=0.5,
+                        help="Maximum gradient norm for clipping")
+    parser.add_argument("--lr", type=float, default=3e-4,
+                        help="Learning rate")
+    parser.add_argument("--lr-schedule", choices=["const","linear"], default="linear",
+                        help="Learning rate schedule")
+    
     args = parser.parse_args()
     
     # Set up save directory
@@ -1366,6 +1405,12 @@ def main():
         print(e)
         print("Tip: run with --list-envs to see registered adapters.")
         raise SystemExit(2)
+    
+    # Create per-role observation normalizers
+    from src.rl.normalizer import RunningNorm
+    norms = {r: RunningNorm() for r in obs_dims.keys()}
+    if args.obs_norm:
+        print(f"[obs-norm] Enabled for roles: {list(norms.keys())}")
     
     if args.dry_run:
         policy = PolicyHead(10, n_act=n_act)  # Use consistent n-action head
@@ -1556,9 +1601,11 @@ def main():
             ep_rew, traj = collect_parallel_adapter(
                 adapter, pi_good, pi_adv, opp_pg, opp_pa, vf_good, vf_adv,
                 learner_role="good", 
-                steps=args.steps, 
+                steps=args.rollout_steps, 
                 device="cpu",
-                curriculum_level=lvl if args.curriculum != "off" else None
+                curriculum_level=lvl if args.curriculum != "off" else None,
+                norms=norms,
+                obs_norm=args.obs_norm
             )
             print(f"Collected {len(traj)} per-agent samples (opponent: {source})")
             
@@ -1584,22 +1631,45 @@ def main():
         batch_g = _make_batch(traj, "good")
         batch_a = _make_batch(traj, "adv")
         
-        # Run PPO per role
+        # Learning rate and entropy coefficient scheduling
+        frac = 1.0 - (update_idx / max(1, args.updates))
+        current_ent_coef = args.ent_coef * (0.1 + 0.9*frac) if args.lr_schedule=="linear" else args.ent_coef
+        current_lr = args.lr * (0.1 + 0.9*frac) if args.lr_schedule=="linear" else args.lr
+        for g in optimizer.param_groups:
+            g["lr"] = current_lr
+        
+        # Run PPO per role with new hyperparameters
         kl_g = kl_a = ent_g = ent_a = 0.0
         
         if batch_g:
             try:
-                pi_g, vf_g, kl_g, ent_g = ppo_update(pi_good, vf_good, optimizer, batch_g,
-                                                     epochs=4, minibatch_size=64)
-                print(f"PPO good: kl={kl_g:.4f} ent={ent_g:.3f}")
+                pi_g, vf_g, kl_g, ent_g = ppo_update(
+                    pi_good, vf_good, optimizer, batch_g,
+                    clip=args.clip_range,
+                    vf_coef=args.vf_coef,
+                    ent_coef=current_ent_coef,
+                    epochs=args.ppo_epochs,
+                    minibatch_size=args.batch_size // args.minibatches,
+                    target_kl=args.target_kl,
+                    max_grad_norm=args.max_grad_norm
+                )
+                print(f"PPO good: kl={kl_g:.4f} ent={ent_g:.3f} lr={current_lr:.2e}")
             except Exception as e:
                 print(f"PPO update failed for good agents: {e}")
         
         if batch_a:
             try:
-                pi_a, vf_a, kl_a, ent_a = ppo_update(pi_adv, vf_adv, optimizer, batch_a,
-                                                     epochs=4, minibatch_size=64)
-                print(f"PPO adv: kl={kl_a:.4f} ent={ent_a:.3f}")
+                pi_a, vf_a, kl_a, ent_a = ppo_update(
+                    pi_adv, vf_adv, optimizer, batch_a,
+                    clip=args.clip_range,
+                    vf_coef=args.vf_coef,
+                    ent_coef=current_ent_coef,
+                    epochs=args.ppo_epochs,
+                    minibatch_size=args.batch_size // args.minibatches,
+                    target_kl=args.target_kl,
+                    max_grad_norm=args.max_grad_norm
+                )
+                print(f"PPO adv: kl={kl_a:.4f} ent={ent_a:.3f} lr={current_lr:.2e}")
             except Exception as e:
                 print(f"PPO update failed for adversary agents: {e}")
         
@@ -1628,7 +1698,8 @@ def main():
         policy.vf["good"].load_state_dict(vf_good.state_dict())
         policy.vf["adv"].load_state_dict(vf_adv.state_dict())
         
-        meta = {"obs_dims": obs_dims, "schema": "v2-roles"}
+        meta = {"obs_dims": obs_dims, "schema": "v2-roles",
+                "norm": {r: norms[r].state_dict() for r in norms}}
         save_checkpoint(policy, meta, last_path)
         print(f"[ckpt v2] wrote {last_path}")
         
