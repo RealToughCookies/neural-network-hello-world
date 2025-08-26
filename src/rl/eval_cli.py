@@ -78,6 +78,8 @@ def main():
     parser.add_argument('--pool', default='artifacts/rl_opponents.json', help='Opponent pool JSON file')
     parser.add_argument('--allow-dim-adapter', action='store_true', default=False,
                        help='Allow dimension adapter for obs dim mismatches')
+    parser.add_argument("--dota-difficulty", type=float, default=2.0,
+                        help="Difficulty level (0..3) for dota_last_hit eval")
     args = parser.parse_args()
     
     # Handle list-envs option
@@ -108,6 +110,12 @@ def main():
     # Create environment adapter
     try:
         adapter = make_adapter(args.env, render_mode=None)
+        
+        # Set difficulty for dota_last_hit environment
+        if hasattr(adapter, "set_difficulty"):
+            adapter.set_difficulty(args.dota_difficulty)
+            print(f"Set difficulty to {args.dota_difficulty}")
+            
         adapter.reset(seed=args.seed)
         print(f"Created environment: {args.env}")
         

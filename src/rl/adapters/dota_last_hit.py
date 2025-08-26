@@ -24,21 +24,61 @@ class DotaLastHitAdapter:
         self._cd   = {"good": 0.0, "adv": 0.0}
         self._wind = {"good": 0.0, "adv": 0.0}  # windup timer ticks
         self._dmg  = {}  # role -> (min,max)
+        self._move_noise = 0.0  # movement noise factor
+        
+        # Difficulty control
+        self._difficulty = 0
+        # per-level params (tweakable)
+        self._levels = {
+            0: dict(hp_decay=20.0, base_cd=2, dmg_jitter=0.0, start_dist=0.0, move_noise=0.0),
+            1: dict(hp_decay=14.0, base_cd=4, dmg_jitter=0.05, start_dist=1.0, move_noise=0.0),
+            2: dict(hp_decay=10.0, base_cd=6, dmg_jitter=0.10, start_dist=1.0, move_noise=0.05),
+            3: dict(hp_decay=8.0,  base_cd=8, dmg_jitter=0.15, start_dist=1.0, move_noise=0.10),
+        }
+
+    def set_difficulty(self, level: int | float) -> None:
+        # allow fractional but clamp 0..3
+        lvl = max(0.0, min(3.0, float(level)))
+        self._difficulty = lvl
+
+    def _params(self):
+        # linear interpolate between integer levels if fractional
+        import math
+        l0 = int(math.floor(self._difficulty)); l1 = int(math.ceil(self._difficulty))
+        if l0 == l1: return self._levels[l0]
+        a = self._levels[l0]; b = self._levels[l1]; t = self._difficulty - l0
+        def lerp(x,y): 
+            if isinstance(x, (int,float)) and isinstance(y, (int,float)): return (1-t)*x + t*y
+            return x
+        return {k: lerp(a[k], b[k]) for k in a}
 
     # ---- EnvAdapter API ----
     def reset(self, seed: int | None = None) -> Timestep:
         if seed is not None:
             self._rng = np.random.default_rng(seed)
+        
+        # Get difficulty-adjusted parameters
+        p = self._params()
+        
         self._t = 0
         self._hp = self.hp0
-        self._dist = {"good": 1.0, "adv": 1.0}
+        self._dist = {"good": float(p["start_dist"]), "adv": float(p["start_dist"])}
         self._cd   = {"good": 0.0, "adv": 0.0}
         self._wind = {"good": 0.0, "adv": 0.0}
-        # slightly asymmetric damage bands per episode
-        self._dmg = {
-            "good": (42.0, 50.0),
-            "adv":  (41.0, 49.0),
-        }
+        self.base_cd = int(round(p["base_cd"]))
+        self.hp_decay = float(p["hp_decay"])
+        self._move_noise = float(p["move_noise"])
+        
+        # Apply damage jitter to base damage bands
+        jitter = float(p["dmg_jitter"])
+        base_good = (42.0, 50.0)
+        base_adv  = (41.0, 49.0)
+        def jitter_band(lo,hi):
+            span = hi - lo
+            d = span * jitter
+            return (lo - d, hi + d)
+        self._dmg = {"good": jitter_band(*base_good), "adv": jitter_band(*base_adv)}
+        
         return self._obs_ts({})
 
     def step(self, actions: Dict[str, int]) -> Timestep:
@@ -48,6 +88,11 @@ class DotaLastHitAdapter:
                 self._dist[role] = max(0.0, self._dist[role] - 1.0)
             elif a == 2:  # step_out
                 self._dist[role] = min(3.0, self._dist[role] + 1.0)
+
+        # apply movement noise if enabled
+        if self._move_noise > 0:
+            for r in self._agents:
+                self._dist[r] = float(np.clip(self._dist[r] + self._rng.normal(0, self._move_noise), 0.0, 3.0))
 
         # tick down cooldowns/windups
         for r in self._agents:
@@ -88,6 +133,30 @@ class DotaLastHitAdapter:
             rew[last_hit] = 1.0
             other = "adv" if last_hit == "good" else "good"
             rew[other] = -1.0
+
+        # ===== reward shaping additions =====
+        # compute shaping per-agent BEFORE dones return:
+        shp = {r: 0.0 for r in self._agents}
+        
+        # "setup" bonus when poised to last-hit
+        def in_kill_window():
+            # window = mean dmg * 1.2 (heuristic)
+            mean_dmg = np.mean(self._dmg["good"])
+            return self._hp <= max(1.0, mean_dmg * 1.2)
+        
+        if in_kill_window():
+            for r in self._agents:
+                if self._dist[r] == 0.0 and self._cd[r] == 0.0:
+                    shp[r] += 0.02
+        
+        # "waste" penalty: attack pressed out of range or on cd
+        for r,a in actions.items():
+            if a == 3 and (self._dist[r] > 0.0 or self._cd[r] > 0.0):
+                shp[r] -= 0.01
+
+        # merge with existing rewards
+        for r in self._agents:
+            rew[r] += shp[r]
 
         done_flag = (last_hit is not None) or (self._t >= self.max_steps) or (self._hp <= 0.0)
         dones = {r: done_flag for r in self._agents}

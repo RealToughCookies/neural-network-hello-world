@@ -39,6 +39,25 @@ def make_env_adapter(env_name: str, seed: int):
     return adapter, roles, obs_dims, n_actions, agents
 
 
+def _parse_milestones(spec: str):
+    parts = []
+    for tok in spec.split(","):
+        p, l = tok.split(":")
+        parts.append((float(p), float(l)))
+    parts.sort()
+    return parts
+
+def schedule_level(curriculum: str, progress: float, milestones):
+    progress = max(0.0, min(1.0, progress))
+    if curriculum == "off": return 2.0
+    if curriculum == "linear": return 3.0 * progress
+    # stairs
+    lvl = milestones[0][1]
+    for p, l in milestones:
+        if progress >= p: lvl = l
+    return lvl
+
+
 def _absdir(p: str) -> Path:
     """Convert string path to resolved absolute Path object."""
     return Path(p).expanduser().resolve()
@@ -284,10 +303,14 @@ def _act_for_keys(keys, obs_dict, pi_good, pi_adv, device="cpu"):
     return out
 
 
-def collect_parallel_adapter(adapter, pi_good_l, pi_adv_l, pi_good_o, pi_adv_o, vf_good, vf_adv, learner_role="good", steps=512, device="cpu"):
+def collect_parallel_adapter(adapter, pi_good_l, pi_adv_l, pi_good_o, pi_adv_o, vf_good, vf_adv, learner_role="good", steps=512, device="cpu", curriculum_level=None):
     """Collect per-agent trajectories from environment adapter with role-specific heads."""
     import torch
     import numpy as np
+    
+    # Apply curriculum difficulty if specified
+    if curriculum_level is not None and hasattr(adapter, "set_difficulty"):
+        adapter.set_difficulty(curriculum_level)
     
     # Reset environment
     ts = adapter.reset()
@@ -1290,6 +1313,12 @@ def main():
     parser.add_argument('--pin-pz124', action='store_true', default=False,
                        help='Assert PettingZoo version starts with 1.24')
     
+    # Curriculum learning arguments
+    parser.add_argument("--curriculum", choices=["off","stairs","linear"], default="stairs",
+                        help="Schedule difficulty levels for dota_last_hit")
+    parser.add_argument("--cur-milestones", type=str, default="0.0:0,0.33:1,0.66:2,0.85:3",
+                        help='For "stairs": comma list prog:level, e.g. "0.0:0,0.5:1,0.8:2,0.9:3"')
+    
     args = parser.parse_args()
     
     # Set up save directory
@@ -1450,8 +1479,18 @@ def main():
     # Training loop with robust checkpoint saving
     _ensure_artifacts()
     
+    # Parse curriculum milestones
+    milestones = _parse_milestones(args.cur_milestones)
+    
     for update_idx in range(start_update, start_update + args.updates):
         print(f"\n=== Update {update_idx + 1}/{start_update + args.updates} ===")
+        
+        # Calculate curriculum progress and level
+        total_steps_done = update_idx * args.steps
+        progress = min(1.0, total_steps_done / float(args.updates * args.steps))
+        lvl = schedule_level(args.curriculum, progress, milestones)
+        if args.curriculum != "off":
+            print(f"Curriculum: progress={progress:.3f}, level={lvl:.2f}")
         
         # Pick opponent for this episode
         try:
@@ -1464,7 +1503,8 @@ def main():
                 adapter, pi_good, pi_adv, opp_pg, opp_pa, vf_good, vf_adv,
                 learner_role="good", 
                 steps=args.steps, 
-                device="cpu"
+                device="cpu",
+                curriculum_level=lvl if args.curriculum != "off" else None
             )
             print(f"Collected {len(traj)} per-agent samples (opponent: {source})")
             
