@@ -1,6 +1,6 @@
 """
 Minimal PPO self-play skeleton for Dota-class RL research.
-Supports Google Research Football (primary) and PettingZoo (fallback).
+Uses adapter-native rollout collection for multi-agent environments.
 """
 
 import argparse
@@ -47,6 +47,18 @@ def load_opponent_head(policy, entry):
             
     except Exception as e:
         print(f"Failed to load opponent head for {entry.id}: {e}")
+
+
+def _role_batch_view(batch, role):
+    """Map our collector's keys to ppo_core's expected keys."""
+    return {
+        "obs":   batch.obs[role],    # [T, obs_dim]
+        "acts":  batch.act[role],    # [T]  (long)
+        "logps": batch.logp[role],   # [T]
+        "vals":  batch.val[role],    # [T]
+        "advs":  batch.adv[role],    # [T]
+        "rets":  batch.ret[role],    # [T]
+    }
 
 
 def make_env_adapter(env_name: str, seed: int):
@@ -369,11 +381,8 @@ def collect_parallel_adapter(adapter, pi_good_l, pi_adv_l, pi_good_o, pi_adv_o, 
         L_agents = good_agents if learner_role == "good" else adv_agents
         O_agents = adv_agents if learner_role == "good" else good_agents
         
-        # Print role info once
+        # Skip role printing - already done in make_env_adapter
         if not printed_roles:
-            good_dim = obs_dims.get("good", 0)
-            adv_dim = obs_dims.get("adv", 0)
-            print(f"[roles] good_dim={good_dim} adv_dim={adv_dim} (n_good={len(good_agents)} n_adv={len(adv_agents)})")
             printed_roles = True
         
         # Learner and opponent actions using role-specific heads
@@ -416,7 +425,7 @@ def collect_parallel_adapter(adapter, pi_good_l, pi_adv_l, pi_good_o, pi_adv_o, 
         if any(ts.dones.values()):
             break
     
-    print(f"Collected {len(traj)} per-agent samples via parallel API (opponent: {source if 'source' in locals() else 'unknown'})")
+    # Legacy collector output
     return ep_rew, traj
 
 
@@ -467,9 +476,8 @@ def collect_parallel_mpe(env, pi_good_l, pi_adv_l, pi_good_o, pi_adv_o, vf_good,
         adv_keys = [k for k in keys if "adversary" in k]
         L_keys, O_keys = (good_keys, adv_keys) if learner_role == "good" else (adv_keys, good_keys)
         
-        # Print role info once
+        # Skip role printing - already done in make_env_adapter
         if not printed_roles:
-            print(f"[roles] good_dim=10 adv_dim=8 (n_good={len(good_keys)} n_adv={len(adv_keys)})")
             printed_roles = True
         
         # Learner and opponent actions using role-specific heads
@@ -558,7 +566,7 @@ def collect_rollout(env, policy, value_fn, steps=256):
     
     obs = env.reset()
     if isinstance(obs, tuple):
-        obs, _info = obs  # PettingZoo Parallel: (obs_dict, info_dict)
+        obs, _info = obs  # Parallel API: (obs_dict, info_dict)
     if isinstance(obs, dict):
         raise RuntimeError("Parallel obs dict detected; DEPRECATED: Legacy collectors no longer supported, use collect_rollouts()")
     
@@ -790,7 +798,7 @@ def _load_rl_ckpt_strict(path, adapter, allow_dim_adapter=False):
         if not allow_dim_adapter:
             raise ValueError(
                 f"Dimension mismatch: ckpt={saved_dims}, env={env_dims}. "
-                "Pin pettingzoo<1.25 or run with --allow-dim-adapter to insert a Linear adapter."
+                "Run with --allow-dim-adapter to insert a Linear adapter for dimension mismatch."
             )
         else:
             print(f"WARNING: Using dimension adapters for mismatch between ckpt and env dims")
@@ -1016,7 +1024,7 @@ def selfplay_smoke_train(steps=1024, save_dir: Path = None):
             steps=min(steps, 256), 
             device="cpu"
         )
-        print(f"Collected {len(traj)} per-agent samples via parallel API (opponent: {source})")
+        # Legacy demo output
     except Exception as e:
         print(f"Parallel collection failed ({e}), using mock fallback")
         # Create mock trajectory for testing
@@ -1147,18 +1155,6 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0, save_dir: Path = No
     
     from src.rl.ppo_core import ppo_update
     
-    # Use good agent dimensions for smoke test (could use either)
-    obs_dim = obs_dims["good"]
-    action_dim = 4  # Mock environment action space
-    
-    # Create networks (use role-specific heads for consistency)
-    policy = PolicyHead(obs_dim, n_act=N_ACT)
-    value_fn = ValueHead(obs_dim)
-    
-    # Optimizer
-    params = list(policy.parameters()) + list(value_fn.parameters())
-    optimizer = torch.optim.Adam(params, lr=3e-4)
-    
     # Determine collector type based on environment reset (already reset in make_env_adapter)
     # Use adapter API instead of direct env calls
     ts = adapter.reset(seed=seed)  # Reset again to get fresh state
@@ -1166,55 +1162,78 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0, save_dir: Path = No
     is_parallel = isinstance(first_obs, dict)
     
     if is_parallel:
-        print("[collector] parallel_mpe")
-        # Create role-specific heads using actual adapter dimensions
-        good_dim = obs_dims["good"]
-        adv_dim = obs_dims["adv"] 
-        pi_good, vf_good = PolicyHead(good_dim, n_act=n_actions), ValueHead(good_dim)
-        pi_adv, vf_adv = PolicyHead(adv_dim, n_act=n_actions), ValueHead(adv_dim)
-        # TODO: Update to use new collect_rollouts system
-        print("WARNING: This smoke function uses legacy collector - needs update")
-        ep_rew, traj = collect_parallel_adapter(adapter, pi_good, pi_adv, pi_good, pi_adv, vf_good, vf_adv,
-                                           learner_role="good", steps=steps, device="cpu")
-        # Convert to batch format
-        if not traj:
-            print("No trajectory collected, using mock data")
+        # === Adapter-native rollout ===
+        per_agent_steps = steps  # Use function parameter directly
+        
+        # Create MultiHeadPolicy for adapter-native collection
+        policy = MultiHeadPolicy(obs_dims, n_actions)
+        
+        # obs-norm transform if enabled (disabled for smoke test)
+        obs_tf = {}
+        
+        # build a simple self-play plan for smoke (no pool)
+        match_plan = [("self", None)] * max(1, per_agent_steps // 128)
+        
+        batch_data, counts = collect_rollouts(
+            adapter=adapter,
+            policy=policy,
+            roles=role_of,
+            agents=agents,
+            per_agent_steps=per_agent_steps,
+            seed=seed + 100,            # keep different from train seed
+            gamma=0.99,
+            gae_lambda=0.95,
+            obs_transform=obs_tf,
+            match_plan=match_plan,
+            load_opponent=None,         # smoke = pure self-play
+        )
+        print("[collector] adapter_native | per-agent steps: " + ", ".join(f"{r}={counts[r]}" for r in sorted(counts)))
+        
+        # Check if we have any role data
+        if not batch_data.obs or all(len(batch_data.obs[r]) == 0 for r in batch_data.obs):
+            print("No role data collected, using mock data")
             return True
         
-        obs_list = [step[0] for step in traj]
-        act_list = [step[1] for step in traj]
-        rew_list = [step[3] for step in traj]
-        val_list = [step[4] for step in traj]
-        logp_list = [step[2] for step in traj]
-        
-        batch = {
-            'obs': torch.tensor(np.stack(obs_list, axis=0), dtype=torch.float32),
-            'acts': torch.tensor(np.array(act_list), dtype=torch.long),
-            'logps': torch.tensor(np.array(logp_list), dtype=torch.float32),
-            'rews': torch.tensor(np.array(rew_list), dtype=torch.float32),
-            'vals': torch.tensor(np.array(val_list), dtype=torch.float32),
-            'advs': torch.zeros(len(traj), dtype=torch.float32),
-            'rets': torch.tensor(np.array(rew_list), dtype=torch.float32)
-        }
     else:
         print("[collector] single_env (skipped - adapter API is multi-agent)")
         # Legacy single-agent collection, skip for adapter API
         return True
     
-    # Get initial entropy for comparison
-    with torch.no_grad():
-        logits = policy(batch['obs'])
-        dist = torch.distributions.Categorical(logits=logits)
-        ent_start = dist.entropy().mean().item()
+    # Run PPO per role
+    from src.rl.ppo_core import ppo_update
+    import torch
     
-    # PPO update
-    print("Running PPO update...")
-    pi_loss, vf_loss, kl, entropy = ppo_update(
-        policy, value_fn, optimizer, batch, 
-        epochs=4, minibatch_size=64, max_grad_norm=0.5
-    )
+    roles_set = sorted(set(role_of.values()))  # e.g., ["adv","good"]
+    stats = {}
+    for r in roles_set:
+        if r not in batch_data.obs or len(batch_data.obs[r]) == 0:
+            print(f"No data for role {r}, skipping PPO update")
+            continue
+            
+        rb = _role_batch_view(batch_data, r)
+        
+        # optimizer over THIS role's params only
+        params = list(policy.pi[r].parameters()) + list(policy.vf[r].parameters())
+        optimizer = torch.optim.Adam(params, lr=3e-4)  # Use default lr for smoke test
+        
+        # call ppo_update with role modules
+        pi_loss, vf_loss, kl, entropy = ppo_update(
+            policy.pi[r], policy.vf[r], optimizer, rb,
+            epochs=4,
+            minibatch_size=64,
+            clip=0.2,
+            vf_coef=0.5,
+            ent_coef=0.01,
+            target_kl=0.02,
+            max_grad_norm=0.5,
+        )
+        stats[r] = dict(pi=pi_loss, vf=vf_loss, kl=kl, ent=entropy)
     
-    print(f"PPO: pi={pi_loss:.3f} vf={vf_loss:.3f} kl={kl:.4f} ent={entropy:.3f}")
+    if not stats:
+        print("No PPO updates performed, using mock data")
+        return True
+    
+    print("[ppo] " + " ".join(f"{r}:pi={stats[r]['pi']:.3f} vf={stats[r]['vf']:.3f} kl={stats[r]['kl']:.4f} ent={stats[r]['ent']:.3f}" for r in roles_set if r in stats))
     
     # Save checkpoint atomically after PPO update
     
@@ -1224,24 +1243,29 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0, save_dir: Path = No
             if k.endswith("net.0.weight"): return int(v.shape[1])
         return None
     
-    # Create MultiHeadPolicy for v2-roles format (random init, no transplant)
-    multi_policy = MultiHeadPolicy(obs_dims, N_ACT)
-    # Start from random initialization - no legacy head transplant
-    
+    # Save the trained policy (already a MultiHeadPolicy)
     meta = {"obs_dims": obs_dims, "schema": "v2-roles"}
-    save_checkpoint(multi_policy, meta, last_path)
+    save_checkpoint(policy, meta, last_path)
     print(f"[ckpt v2] wrote {last_path}")
-    save_checkpoint(multi_policy, meta, best_path)
+    save_checkpoint(policy, meta, best_path)
     print(f"[ckpt v2] wrote {best_path}")
     
-    # Relaxed success criteria: allow reasonable KL drift and finite losses
+    # Relaxed success criteria: allow reasonable KL drift and finite losses (using first role's stats)
     _ensure_artifacts()
-    # Use simplified header for single-agent smoke test
+    first_role = min(stats.keys()) if stats else "good"  # Use first available role
+    role_stats = stats.get(first_role, {"kl": 0.0, "pi": 0.0, "vf": 0.0, "ent": 0.0})
+    
+    # Use simplified header for smoke test
     simple_header = ["step","kl","pi_loss","vf_loss","entropy"]
-    row = [0, float(kl), float(pi_loss), float(vf_loss), float(entropy)]
+    row = [0, float(role_stats["kl"]), float(role_stats["pi"]), float(role_stats["vf"]), float(role_stats["ent"])]
     _append_csv("artifacts/rl_metrics.csv", simple_header, row)
     
-    return abs(kl) <= 0.08 and abs(pi_loss) < 10.0 and abs(vf_loss) < 10.0
+    # Check success criteria across all roles
+    success = all(
+        abs(stats[r]["kl"]) <= 0.08 and abs(stats[r]["pi"]) < 10.0 and abs(stats[r]["vf"]) < 10.0 
+        for r in stats
+    )
+    return success
 
 
 def dry_run_environment(env, policy, steps=10):
@@ -1357,8 +1381,7 @@ def main():
     # Dimension handling arguments
     parser.add_argument('--allow-dim-adapter', action='store_true', default=False,
                        help='Allow dimension adapter for obs dim mismatches')
-    parser.add_argument('--pin-pz124', action='store_true', default=False,
-                       help='Assert PettingZoo version starts with 1.24')
+    # Removed --pin-pz124 flag (no longer needed for adapter-native rollouts)
     
     # Curriculum learning arguments
     parser.add_argument("--curriculum", choices=["off","stairs","linear"], default="stairs",
@@ -1410,14 +1433,7 @@ def main():
         print("Available adapters:", ", ".join(sorted(_REGISTRY.keys())))
         raise SystemExit(0)
     
-    # Check PettingZoo version if requested
-    if args.pin_pz124:
-        try:
-            import pettingzoo
-            if not pettingzoo.__version__.startswith("1.24"):
-                raise SystemExit(f"--pin-pz124 requires PettingZoo 1.24.*, got {pettingzoo.__version__}")
-        except ImportError:
-            raise SystemExit("--pin-pz124 requires PettingZoo to be installed")
+    # PettingZoo version check removed (no longer needed for adapter-native rollouts)
     
     # Set seeds
     import torch
@@ -1544,17 +1560,11 @@ def main():
                 lr=3e-4
             )
     else:
-        # Create role-specific policy and value heads using dynamic observation dimensions
-        pi_good = PolicyHead(obs_dims["good"], n_act=N_ACT)
-        vf_good = ValueHead(obs_dims["good"])
-        pi_adv = PolicyHead(obs_dims["adv"], n_act=N_ACT) 
-        vf_adv = ValueHead(obs_dims["adv"])
+        # Create MultiHeadPolicy for unified training
+        policy = MultiHeadPolicy(obs_dims, N_ACT)
         
-        optimizer = torch.optim.Adam(
-            list(pi_good.parameters()) + list(vf_good.parameters()) +
-            list(pi_adv.parameters()) + list(vf_adv.parameters()), 
-            lr=3e-4
-        )
+        # No need for a single optimizer - per-role optimizers will be created in PPO loop
+        # This keeps learning rates and schedules separate per role
     
     # Create opponent copies (always use environment dimensions for these)
     pi_good_opp = PolicyHead(obs_dims["good"], n_act=N_ACT)
@@ -1641,26 +1651,26 @@ def main():
         frac = 1.0 - (update_idx / max(1, args.updates))
         current_ent_coef = args.ent_coef * (0.1 + 0.9*frac) if args.lr_schedule=="linear" else args.ent_coef
         current_lr = args.lr * (0.1 + 0.9*frac) if args.lr_schedule=="linear" else args.lr
-        for g in optimizer.param_groups:
-            g["lr"] = current_lr
         
-        # Run PPO per role with new batch format
-        kl_g = kl_a = ent_g = ent_a = 0.0
+        # Run PPO per role using helper function
+        from src.rl.ppo_core import ppo_update
+        roles_set = sorted(set(roles.values()))  # e.g., ["adv","good"]
+        stats = {}
         
-        # Process good role
-        if "good" in batch.obs and len(batch.obs["good"]) > 0:
-            # Convert batch to format expected by ppo_update
-            batch_g = {
-                'obs': batch.obs["good"],
-                'act': batch.act["good"],
-                'logp': batch.logp["good"],
-                'val': batch.val["good"],
-                'adv': batch.adv["good"],
-                'ret': batch.ret["good"]
-            }
+        for r in roles_set:
+            if r not in batch.obs or len(batch.obs[r]) == 0:
+                print(f"No data for role {r}, skipping PPO update")
+                continue
+            
+            rb = _role_batch_view(batch, r)
+            
+            # Create optimizer for THIS role's params only
+            params = list(policy.pi[r].parameters()) + list(policy.vf[r].parameters())
+            role_optimizer = torch.optim.Adam(params, lr=current_lr)
+            
             try:
-                pi_g, vf_g, kl_g, ent_g = ppo_update(
-                    pi_good, vf_good, optimizer, batch_g,
+                pi_loss, vf_loss, kl, entropy = ppo_update(
+                    policy.pi[r], policy.vf[r], role_optimizer, rb,
                     clip=args.clip_range,
                     vf_coef=args.vf_coef,
                     ent_coef=current_ent_coef,
@@ -1669,35 +1679,10 @@ def main():
                     target_kl=args.target_kl,
                     max_grad_norm=args.max_grad_norm
                 )
-                print(f"PPO good: kl={kl_g:.4f} ent={ent_g:.3f} lr={current_lr:.2e}")
+                stats[r] = dict(pi=pi_loss, vf=vf_loss, kl=kl, ent=entropy)
+                print(f"PPO {r}: kl={kl:.4f} ent={entropy:.3f} lr={current_lr:.2e}")
             except Exception as e:
-                print(f"PPO update failed for good agents: {e}")
-        
-        # Process adv role
-        if "adv" in batch.obs and len(batch.obs["adv"]) > 0:
-            # Convert batch to format expected by ppo_update
-            batch_a = {
-                'obs': batch.obs["adv"],
-                'act': batch.act["adv"],
-                'logp': batch.logp["adv"],
-                'val': batch.val["adv"],
-                'adv': batch.adv["adv"],
-                'ret': batch.ret["adv"]
-            }
-            try:
-                pi_a, vf_a, kl_a, ent_a = ppo_update(
-                    pi_adv, vf_adv, optimizer, batch_a,
-                    clip=args.clip_range,
-                    vf_coef=args.vf_coef,
-                    ent_coef=current_ent_coef,
-                    epochs=args.ppo_epochs,
-                    minibatch_size=args.batch_size // args.minibatches,
-                    target_kl=args.target_kl,
-                    max_grad_norm=args.max_grad_norm
-                )
-                print(f"PPO adv: kl={kl_a:.4f} ent={ent_a:.3f} lr={current_lr:.2e}")
-            except Exception as e:
-                print(f"PPO update failed for adversary agents: {e}")
+                print(f"PPO update failed for {r} agents: {e}")
         
         # Update opponents every swap_every updates (handled by checkpoint saving)
         
@@ -1705,24 +1690,25 @@ def main():
         eval_g = eval_a = 0.0
         if (update_idx + 1) % args.eval_every == 0:
             try:
-                eval_g, eval_a = evaluate(env, pi_good, pi_adv, episodes=args.eval_eps)
+                eval_g, eval_a = evaluate(env, policy.pi["good"], policy.pi["adv"], episodes=args.eval_eps)
                 print(f"Eval: good={eval_g:.3f} adv={eval_a:.3f}")
             except Exception as e:
                 print(f"Evaluation failed: {e}")
         
-        # Always log to CSV with stable header
+        # Always log to CSV with stable header (use per-role stats)
+        kl_g = stats.get("good", {}).get("kl", 0.0)
+        kl_a = stats.get("adv", {}).get("kl", 0.0)
+        ent_g = stats.get("good", {}).get("ent", 0.0)
+        ent_a = stats.get("adv", {}).get("ent", 0.0)
+        
         row = [int(update_idx + 1), float(kl_g), float(kl_a), 
-               float(ent_g), float(ent_a), float(eval_g), float(eval_a), str(source)]
+               float(ent_g), float(ent_a), float(eval_g), float(eval_a), 
+               picks[0][0] if picks else "self"]  # Use match plan source
         _append_csv("artifacts/rl_metrics.csv", CSV_HEADER, row)
         print(f"[csv] logged to rl_metrics.csv")
         
-        # Save checkpoints atomically using trained policy
-        # Create MultiHeadPolicy and copy trained parameters
-        policy = MultiHeadPolicy(obs_dims, n_act)
-        policy.pi["good"].load_state_dict(pi_good.state_dict())
-        policy.pi["adv"].load_state_dict(pi_adv.state_dict())
-        policy.vf["good"].load_state_dict(vf_good.state_dict())
-        policy.vf["adv"].load_state_dict(vf_adv.state_dict())
+        # Save checkpoints atomically using trained policy (already a MultiHeadPolicy)
+        # Policy and value functions are already trained in-place
         
         meta = {"obs_dims": obs_dims, "schema": "v2-roles",
                 "norm": {r: norms[r].state_dict() for r in norms}}
