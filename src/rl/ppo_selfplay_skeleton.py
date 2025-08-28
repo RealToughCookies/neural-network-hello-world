@@ -1639,8 +1639,9 @@ def main():
         if lvl is not None and args.curriculum != "off" and hasattr(adapter, "set_difficulty"):
             adapter.set_difficulty(lvl)
         
-        # Collect rollouts using adapter-native collector
-        batch, counts = collect_rollouts(
+        try:
+            # Collect rollouts using adapter-native collector
+            batch, counts = collect_rollouts(
                 adapter=adapter,
                 policy=policy,
                 roles=roles,
@@ -1667,117 +1668,117 @@ def main():
                     learner_id = f"current-learner-{global_step}"
                     pool.record_result(learner_id=learner_id, opp_id=selected_agent["id"], result=result)
                     print(f"Recorded {'win' if result == 1.0 else 'loss'} vs {selected_agent['id']} (avg_adv={avg_adv:.3f})")
+            
+            # Learning rate and entropy coefficient scheduling
+            frac = 1.0 - (update_idx / max(1, args.updates))
+            current_ent_coef = args.ent_coef * (0.1 + 0.9*frac) if args.lr_schedule=="linear" else args.ent_coef
+            current_lr = args.lr * (0.1 + 0.9*frac) if args.lr_schedule=="linear" else args.lr
+            
+            # Run PPO per role using helper function
+            from src.rl.ppo_core import ppo_update
+            roles_set = sorted(set(roles.values()))  # e.g., ["adv","good"]
+            stats = {}
+            
+            for r in roles_set:
+                if r not in batch.obs or len(batch.obs[r]) == 0:
+                    print(f"No data for role {r}, skipping PPO update")
+                    continue
                 
+                rb = _role_batch_view(batch, r)
+                
+                # Use persistent role optimizer with updated learning rate
+                role_optimizer = opt[r]
+                for g in role_optimizer.param_groups:
+                    g["lr"] = current_lr
+                
+                try:
+                    pi_loss, vf_loss, kl, entropy = ppo_update(
+                        policy.pi[r], policy.vf[r], role_optimizer, rb,
+                        clip=args.clip_range,
+                        vf_coef=args.vf_coef,
+                        ent_coef=current_ent_coef,
+                        epochs=args.ppo_epochs,
+                        minibatch_size=args.batch_size // args.minibatches,
+                        target_kl=args.target_kl,
+                        max_grad_norm=args.max_grad_norm
+                    )
+                    stats[r] = dict(pi=pi_loss, vf=vf_loss, kl=kl, ent=entropy)
+                    print(f"PPO {r}: kl={kl:.4f} ent={entropy:.3f} lr={current_lr:.2e}")
+                except Exception as e:
+                    print(f"PPO update failed for {r} agents: {e}")
+            
+            # Update opponents every swap_every updates (handled by checkpoint saving)
+            
+            # Run evaluation every eval_every updates
+            eval_g = eval_a = 0.0
+            if (update_idx + 1) % args.eval_every == 0:
+                try:
+                    eval_g, eval_a = evaluate(env, policy.pi["good"], policy.pi["adv"], episodes=args.eval_eps)
+                    print(f"Eval: good={eval_g:.3f} adv={eval_a:.3f}")
+                except Exception as e:
+                    print(f"Evaluation failed: {e}")
+            
+            # Always log to CSV with stable header (use per-role stats)
+            kl_g = stats.get("good", {}).get("kl", 0.0)
+            kl_a = stats.get("adv", {}).get("kl", 0.0)
+            ent_g = stats.get("good", {}).get("ent", 0.0)
+            ent_a = stats.get("adv", {}).get("ent", 0.0)
+            
+            row = [int(update_idx + 1), float(kl_g), float(kl_a), 
+                   float(ent_g), float(ent_a), float(eval_g), float(eval_a), 
+                   picks[0][0] if picks else "self"]  # Use match plan source
+            _append_csv("artifacts/rl_metrics.csv", CSV_HEADER, row)
+            print(f"[csv] logged to rl_metrics.csv")
+            
+            # Update counters
+            updates_done = update_idx + 1
+            global_step += args.rollout_steps * len(roles_set)  # rough estimate
+            
+            # Save checkpoints
+            save_dir = Path(args.save_dir)
+            
+            bundle = make_bundle(
+                version=3,
+                model_state=policy.state_dict(),
+                optim_state={r: opt[r].state_dict() for r in opt},
+                sched_state={r: sched[r].state_dict() for r in sched} if sched else None,
+                obs_norm_state={r: norms[r].state_dict() for r in norms} if norms else None,
+                adv_norm_state=None,
+                rng_state=_capture_rng(),
+                counters={"global_step": global_step, "update_idx": updates_done, "episodes": updates_done},
+                meta={"created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                      "env": args.env, "adapter": args.env, "seed": args.seed}
+            )
+            save_checkpoint_v3(bundle, save_dir)
+            print("ckpt v3 → last.pt (bundle), last_model.pt (weights-only)")
+            
+            # Evaluation gating for opponent pool and best checkpoint
+            # Run simplified eval for gating (compute win rates)
+            wr_self = 0.5  # placeholder - could run actual self-play eval
+            wr_uniform = 0.5  # placeholder - could run vs pool eval
+            
+            # Gate best checkpoint update
+            if wr_self >= args.gate_best_min_wr:
+                # Create best.pt and best_model.pt from current bundle
+                shutil.copy2(save_dir / "last.pt", save_dir / "best.pt")
+                shutil.copy2(save_dir / "last_model.pt", save_dir / "best_model.pt")
+                
+                print(f"[gate] saved best checkpoints (wr_self={wr_self:.3f} >= {args.gate_best_min_wr})")
+                best_score = float('inf')  # mark as updated
+            
+            # Add/update agent in v1 Elo pool
+            agent_id = pool.add_or_update_agent(
+                ckpt_path=str(save_dir / "last.pt"),
+                ckpt_kind="v3",
+                roles=list(roles_set),
+                meta={"env": args.env, "global_step": global_step, "seed": args.seed, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            )
+            pool.save()
+            print(f"[pool] updated {args.pool_path} with agent={agent_id}")
+        
         except Exception as e:
             print(f"Collection failed ({e}), skipping update")
             continue
-        
-        # Learning rate and entropy coefficient scheduling
-        frac = 1.0 - (update_idx / max(1, args.updates))
-        current_ent_coef = args.ent_coef * (0.1 + 0.9*frac) if args.lr_schedule=="linear" else args.ent_coef
-        current_lr = args.lr * (0.1 + 0.9*frac) if args.lr_schedule=="linear" else args.lr
-        
-        # Run PPO per role using helper function
-        from src.rl.ppo_core import ppo_update
-        roles_set = sorted(set(roles.values()))  # e.g., ["adv","good"]
-        stats = {}
-        
-        for r in roles_set:
-            if r not in batch.obs or len(batch.obs[r]) == 0:
-                print(f"No data for role {r}, skipping PPO update")
-                continue
-            
-            rb = _role_batch_view(batch, r)
-            
-            # Use persistent role optimizer with updated learning rate
-            role_optimizer = opt[r]
-            for g in role_optimizer.param_groups:
-                g["lr"] = current_lr
-            
-            try:
-                pi_loss, vf_loss, kl, entropy = ppo_update(
-                    policy.pi[r], policy.vf[r], role_optimizer, rb,
-                    clip=args.clip_range,
-                    vf_coef=args.vf_coef,
-                    ent_coef=current_ent_coef,
-                    epochs=args.ppo_epochs,
-                    minibatch_size=args.batch_size // args.minibatches,
-                    target_kl=args.target_kl,
-                    max_grad_norm=args.max_grad_norm
-                )
-                stats[r] = dict(pi=pi_loss, vf=vf_loss, kl=kl, ent=entropy)
-                print(f"PPO {r}: kl={kl:.4f} ent={entropy:.3f} lr={current_lr:.2e}")
-            except Exception as e:
-                print(f"PPO update failed for {r} agents: {e}")
-        
-        # Update opponents every swap_every updates (handled by checkpoint saving)
-        
-        # Run evaluation every eval_every updates
-        eval_g = eval_a = 0.0
-        if (update_idx + 1) % args.eval_every == 0:
-            try:
-                eval_g, eval_a = evaluate(env, policy.pi["good"], policy.pi["adv"], episodes=args.eval_eps)
-                print(f"Eval: good={eval_g:.3f} adv={eval_a:.3f}")
-            except Exception as e:
-                print(f"Evaluation failed: {e}")
-        
-        # Always log to CSV with stable header (use per-role stats)
-        kl_g = stats.get("good", {}).get("kl", 0.0)
-        kl_a = stats.get("adv", {}).get("kl", 0.0)
-        ent_g = stats.get("good", {}).get("ent", 0.0)
-        ent_a = stats.get("adv", {}).get("ent", 0.0)
-        
-        row = [int(update_idx + 1), float(kl_g), float(kl_a), 
-               float(ent_g), float(ent_a), float(eval_g), float(eval_a), 
-               picks[0][0] if picks else "self"]  # Use match plan source
-        _append_csv("artifacts/rl_metrics.csv", CSV_HEADER, row)
-        print(f"[csv] logged to rl_metrics.csv")
-        
-        # Update counters
-        updates_done = update_idx + 1
-        global_step += args.rollout_steps * len(roles_set)  # rough estimate
-        
-        # Save checkpoints
-        save_dir = Path(args.save_dir)
-        
-        bundle = make_bundle(
-            version=3,
-            model_state=policy.state_dict(),
-            optim_state={r: opt[r].state_dict() for r in opt},
-            sched_state={r: sched[r].state_dict() for r in sched} if sched else None,
-            obs_norm_state={r: norms[r].state_dict() for r in norms} if norms else None,
-            adv_norm_state=None,
-            rng_state=_capture_rng(),
-            counters={"global_step": global_step, "update_idx": updates_done, "episodes": updates_done},
-            meta={"created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                  "env": args.env, "adapter": args.env, "seed": args.seed}
-        )
-        save_checkpoint_v3(bundle, save_dir)
-        print("ckpt v3 → last.pt (bundle), last_model.pt (weights-only)")
-        
-        # Evaluation gating for opponent pool and best checkpoint
-        # Run simplified eval for gating (compute win rates)
-        wr_self = 0.5  # placeholder - could run actual self-play eval
-        wr_uniform = 0.5  # placeholder - could run vs pool eval
-        
-        # Gate best checkpoint update
-        if wr_self >= args.gate_best_min_wr:
-            # Create best.pt and best_model.pt from current bundle
-            shutil.copy2(save_dir / "last.pt", save_dir / "best.pt")
-            shutil.copy2(save_dir / "last_model.pt", save_dir / "best_model.pt")
-            
-            print(f"[gate] saved best checkpoints (wr_self={wr_self:.3f} >= {args.gate_best_min_wr})")
-            best_score = float('inf')  # mark as updated
-        
-        # Add/update agent in v1 Elo pool
-        agent_id = pool.add_or_update_agent(
-            ckpt_path=str(save_dir / "last.pt"),
-            ckpt_kind="v3",
-            roles=list(roles_set),
-            meta={"env": args.env, "global_step": global_step, "seed": args.seed, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-        )
-        pool.save()
-        print(f"[pool] updated {args.pool_path} with agent={agent_id}")
     
     print(f"\n[done] Completed {args.updates} updates")
 
