@@ -8,7 +8,12 @@ Usage:
 
 import argparse
 import json
+import sys
+from datetime import datetime
 from pathlib import Path
+
+# add project root (parent of 'scripts') to sys.path so 'src' is importable
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.rl.elo_pool import OpponentPoolV1
 
@@ -24,8 +29,18 @@ def main():
     pool_path = Path(args.pool_path)
     
     if not pool_path.exists():
-        print(f"Pool file not found: {pool_path}")
-        return 1
+        # Create minimal v1 skeleton
+        pool = {
+            "version": "v1-elo-pool",
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "config": {"elo_k": 32, "scale": 400, "initial": 1200},
+            "agents": []
+        }
+        pool_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(pool_path, "w") as f:
+            json.dump(pool, f, indent=2)
+        print(f"[pool] initialized new v1 pool at {pool_path}")
+        return 0
     
     # Load existing pool
     with open(pool_path, 'r') as f:

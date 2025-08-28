@@ -1194,7 +1194,7 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0, save_dir: Path = No
             match_plan=match_plan,
             load_opponent=None,         # smoke = pure self-play
         )
-        print("[collector] adapter_native | per-agent steps: " + ", ".join(f"{r}={counts[r]}" for r in sorted(counts)))
+        print(f"[collector] adapter_native | per-agent steps: {', '.join(f'{r}={counts[r]}' for r in sorted(counts))}")
         
         # Check if we have any role data
         if not batch_data.obs or all(len(batch_data.obs[r]) == 0 for r in batch_data.obs):
@@ -1651,8 +1651,7 @@ def main():
                 load_opponent=load_opponent_head,
             )
             
-            print(f"[collector] adapter_native | per-agent steps: " +
-                  ", ".join([f"{r}={counts[r]}" for r in counts]))
+            print(f"[collector] adapter_native | per-agent steps: {', '.join(f'{r}={counts[r]}' for r in counts)}")
             
             # Record game result for v1 Elo pool
             if selected_agent and match_plan[0][0] == "pool":
