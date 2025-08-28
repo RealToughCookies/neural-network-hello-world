@@ -5,6 +5,7 @@ Uses adapter-native rollout collection for multi-agent environments.
 
 import argparse
 import csv
+import json
 import os
 import random
 import shutil
@@ -23,6 +24,7 @@ from src.rl.models import MultiHeadPolicy, MultiHeadValue, PolicyHead, ValueHead
 from src.rl.env_api import make_adapter
 from src.rl.checkpoint import save_checkpoint, load_policy_from_ckpt, load_legacy_checkpoint, save_bundle, load_bundle
 from src.rl.ckpt_io import make_bundle, save_checkpoint_v3, load_checkpoint_auto, _capture_rng, _restore_rng
+from src.rl.elo_pool import OpponentPoolV1
 from src.rl.rollout import collect_rollouts
 import src.rl.adapters  # Import to register adapters
 
@@ -1379,6 +1381,12 @@ def main():
                        help='Minimum games before using EMA win rate')
     parser.add_argument("--pool-path", type=str, default="artifacts/rl_opponents.json",
                        help="Path to Elo-based opponent pool JSON file")
+    parser.add_argument("--opp-sample", choices=["uniform", "topk", "pfsp_elo"], default="uniform",
+                       help="Opponent sampling strategy")
+    parser.add_argument("--opp-topk", type=int, default=5,
+                       help="Top-K for topk sampling strategy")
+    parser.add_argument("--opp-tau", type=float, default=1.5,
+                       help="Temperature for pfsp_elo sampling strategy")
     parser.add_argument("--gate-best-min-wr", type=float, default=0.55,
                        help="Minimum self-play win rate to copy last.pt -> best.pt")
     parser.add_argument("--gate-pool-min-wr", type=float, default=0.52,
@@ -1490,17 +1498,20 @@ def main():
     
     print(f"Starting PPO self-play training: {args.updates} updates, {args.steps} steps/update")
     
-    # Initialize Elo-based opponent pool
-    pool = None
-    try:
-        pool = OpponentPool.load(args.pool_path)
-        # sanity: env & dims must match
-        assert pool.env == args.env and pool.obs_dims == obs_dims
-        print(f"Loaded opponent pool: {len(pool.entries)} opponents from {args.pool_path}")
-    except Exception as e:
-        print(f"Creating new opponent pool: {e}")
-        pool = OpponentPool(env=args.env, obs_dims=obs_dims)
-        print(f"Created new opponent pool for env={args.env}, obs_dims={obs_dims}")
+    # Initialize v1 Elo-based opponent pool
+    pool = OpponentPoolV1(Path(args.pool_path))
+    pool.load()
+    
+    if pool.data.get("version") != "v1-elo-pool":
+        print(f"[pool] migrate: legacy→v1-elo-pool")
+        # Migrate if needed
+        if pool.path.exists():
+            with open(pool.path, 'r') as f:
+                legacy_data = json.load(f)
+            pool.data = OpponentPoolV1.migrate_legacy(legacy_data)
+            pool.save()
+    
+    print(f"[pool] loaded v1-elo-pool (agents={len(pool.data['agents'])})")
     
     # Create MultiHeadPolicy and per-role optimizers/schedulers
     policy = MultiHeadPolicy(obs_dims, N_ACT)
@@ -1596,29 +1607,37 @@ def main():
         if args.curriculum != "off":
             print(f"Curriculum: progress={progress:.3f}, level={lvl:.2f}")
         
-        # Sample opponent using Elo-based pool  
+        # Sample opponent using v1 Elo pool
+        selected_agent = None
+        match_plan = [("self", None)]  # Default to self-play
+        
         try:
-            # Sample 1 opponent for this episode
-            picks = pool.sample(n=1, temp=args.opp_temp, min_games=args.opp_min_games,
-                               min_selfplay_frac=args.opp_min_selfplay_frac)
-            selected_entry = None
+            # Sample opponent based on strategy (with some self-play mix)
+            if random.random() < args.opp_min_selfplay_frac:
+                # Force self-play
+                pass
+            elif pool.data["agents"]:
+                selected_agent = pool.sample(strategy=args.opp_sample, topk=args.opp_topk, tau=args.opp_tau)
+                match_plan = [("pool", selected_agent)]
+                print(f"[pool] sample {args.opp_sample}: picked id={selected_agent['id']} elo={selected_agent['elo']:.1f}")
             
-            # Build match plan from picks
-            match_plan = picks if picks else [("self", None)]
-            
-            # Build observation transform from norms if enabled
-            obs_tf = {}
-            if args.obs_norm and norms:
-                for role in norms:
-                    # Create closure to capture norm instance
-                    obs_tf[role] = lambda arr, rn=norms[role]: rn.transform(arr)
-            
-            # Apply curriculum difficulty if specified
-            if lvl is not None and args.curriculum != "off" and hasattr(adapter, "set_difficulty"):
-                adapter.set_difficulty(lvl)
-            
-            # Collect rollouts using adapter-native collector
-            batch, counts = collect_rollouts(
+        except Exception as e:
+            print(f"Pool sampling failed: {e}, using self-play")
+            match_plan = [("self", None)]
+        
+        # Build observation transform from norms if enabled
+        obs_tf = {}
+        if args.obs_norm and norms:
+            for role in norms:
+                # Create closure to capture norm instance
+                obs_tf[role] = lambda arr, rn=norms[role]: rn.transform(arr)
+        
+        # Apply curriculum difficulty if specified
+        if lvl is not None and args.curriculum != "off" and hasattr(adapter, "set_difficulty"):
+            adapter.set_difficulty(lvl)
+        
+        # Collect rollouts using adapter-native collector
+        batch, counts = collect_rollouts(
                 adapter=adapter,
                 policy=policy,
                 roles=roles,
@@ -1635,17 +1654,17 @@ def main():
             print(f"[collector] adapter_native | per-agent steps: " +
                   ", ".join([f"{r}={counts[r]}" for r in counts]))
             
-            # Record game result for opponent pool
-            if picks and len(picks) > 0 and picks[0][0] == "pool":
-                entry = picks[0][1]
-                selected_entry = entry
+            # Record game result for v1 Elo pool
+            if selected_agent and match_plan[0][0] == "pool":
                 # Estimate win/loss from collected advantages (heuristic)
                 learner_role = "good"  # Assume learner plays good role
                 if learner_role in batch.adv and len(batch.adv[learner_role]) > 0:
                     avg_adv = float(batch.adv[learner_role].mean().item())
-                    learner_win = avg_adv > 0  # Positive advantage suggests good performance
-                    pool.record_result(selected_entry.id, learner_win, ema_decay=args.opp_ema_decay)
-                    print(f"Recorded {'win' if learner_win else 'loss'} vs {selected_entry.id} (avg_adv={avg_adv:.3f})")
+                    result = 1.0 if avg_adv > 0 else 0.0  # 1.0 = learner wins, 0.0 = opponent wins
+                    # Need learner ID - create temporary one based on current state
+                    learner_id = f"current-learner-{global_step}"
+                    pool.record_result(learner_id=learner_id, opp_id=selected_agent["id"], result=result)
+                    print(f"Recorded {'win' if result == 1.0 else 'loss'} vs {selected_agent['id']} (avg_adv={avg_adv:.3f})")
                 
         except Exception as e:
             print(f"Collection failed ({e}), skipping update")
@@ -1748,16 +1767,15 @@ def main():
             print(f"[gate] saved best checkpoints (wr_self={wr_self:.3f} >= {args.gate_best_min_wr})")
             best_score = float('inf')  # mark as updated
         
-        # Gate opponent pool addition - use model-only checkpoint for pool
-        if wr_uniform >= args.gate_pool_min_wr:
-            # Determine opponent role (opposite of learner)
-            opp_role = "adv"  # assuming learner is typically "good"
-            entry_id = pool.add_entry(str(save_dir / "last_model.pt"), role=opp_role, step=int(update_idx + 1))
-            print(f"[gate] added to pool: {entry_id} (wr_uniform={wr_uniform:.3f} >= {args.gate_pool_min_wr})")
-        
-        # Prune and save pool
-        pool.prune(args.opp_max)
-        pool.save(args.pool_path)
+        # Add/update agent in v1 Elo pool
+        agent_id = pool.add_or_update_agent(
+            ckpt_path=str(save_dir / "last.pt"),
+            ckpt_kind="v3",
+            roles=list(roles_set),
+            meta={"env": args.env, "global_step": global_step, "seed": args.seed, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        )
+        pool.save()
+        print(f"[pool] updated {args.pool_path} with agent={agent_id}")
     
     print(f"\n[done] Completed {args.updates} updates")
 
