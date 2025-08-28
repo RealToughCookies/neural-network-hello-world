@@ -6,6 +6,7 @@ Uses adapter-native rollout collection for multi-agent environments.
 import argparse
 import csv
 import json
+import logging
 import os
 import random
 import shutil
@@ -17,6 +18,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # Import new modules
 from src.rl.env_utils import get_role_maps
@@ -1194,7 +1197,7 @@ def smoke_train(steps=512, env_kind="mpe_adversary", seed=0, save_dir: Path = No
             match_plan=match_plan,
             load_opponent=None,         # smoke = pure self-play
         )
-        print(f"[collector] adapter_native | per-agent steps: {', '.join(f'{r}={counts[r]}' for r in sorted(counts))}")
+        logger.info("[collector] adapter_native | per-agent steps: %s", ", ".join(f"{r}={counts[r]}" for r in sorted(counts)))
         
         # Check if we have any role data
         if not batch_data.obs or all(len(batch_data.obs[r]) == 0 for r in batch_data.obs):
@@ -1651,7 +1654,7 @@ def main():
                 load_opponent=load_opponent_head,
             )
             
-            print(f"[collector] adapter_native | per-agent steps: {', '.join(f'{r}={counts[r]}' for r in counts)}")
+            logger.info("[collector] adapter_native | per-agent steps: %s", ", ".join(f"{r}={counts[r]}" for r in sorted(counts)))
             
             # Record game result for v1 Elo pool
             if selected_agent and match_plan[0][0] == "pool":
