@@ -1369,27 +1369,17 @@ def main():
                        help='Path to v3 bundle file or directory containing last.pt')
     parser.add_argument('--updates', type=int, default=10, help='Number of PPO updates')
     
-    # Opponent pool arguments
-    parser.add_argument('--opp-sample', choices=['prioritized', 'uniform'], default='prioritized',
-                       help='Opponent sampling strategy')
-    parser.add_argument('--opp-min-selfplay-frac', type=float, default=0.10,
-                       help='Minimum fraction of episodes to play self vs self')
-    parser.add_argument('--opp-temp', type=float, default=0.7,
-                       help='Temperature for prioritized opponent sampling')
-    parser.add_argument('--opp-ema-decay', type=float, default=0.97,
-                       help='EMA decay factor for opponent win rates')
-    parser.add_argument('--opp-max', type=int, default=64,
-                       help='Maximum opponents to keep in pool')
-    parser.add_argument('--opp-min-games', type=int, default=5,
-                       help='Minimum games before using EMA win rate')
+    # v1 Elo Pool arguments
     parser.add_argument("--pool-path", type=str, default="artifacts/rl_opponents.json",
                        help="Path to Elo-based opponent pool JSON file")
-    parser.add_argument("--opp-sample", choices=["uniform", "topk", "pfsp_elo"], default="uniform",
+    parser.add_argument("--opp-sample", choices=["uniform", "topk", "pfsp_elo"], default="pfsp_elo",
                        help="Opponent sampling strategy")
     parser.add_argument("--opp-topk", type=int, default=5,
                        help="Top-K for topk sampling strategy")
     parser.add_argument("--opp-tau", type=float, default=1.5,
                        help="Temperature for pfsp_elo sampling strategy")
+    parser.add_argument('--opp-min-selfplay-frac', type=float, default=0.10,
+                       help='Minimum fraction of episodes to play self vs self')
     parser.add_argument("--gate-best-min-wr", type=float, default=0.55,
                        help="Minimum self-play win rate to copy last.pt -> best.pt")
     parser.add_argument("--gate-pool-min-wr", type=float, default=0.52,
@@ -1497,7 +1487,6 @@ def main():
     # Full self-play training loop with robust checkpointing
     from src.rl.selfplay import evaluate
     from src.rl.ppo_core import ppo_update
-    from src.rl.opponent_pool import OpponentPool
     
     print(f"Starting PPO self-play training: {args.updates} updates, {args.steps} steps/update")
     
@@ -1514,7 +1503,7 @@ def main():
             pool.data = OpponentPoolV1.migrate_legacy(legacy_data)
             pool.save()
     
-    print(f"[pool] loaded v1-elo-pool (agents={len(pool.data['agents'])})")
+    logger.info("[pool] loaded v1-elo-pool (agents=%d)", len(pool.data['agents']))
     
     # Create MultiHeadPolicy and per-role optimizers/schedulers
     policy = MultiHeadPolicy(obs_dims, N_ACT)
@@ -1622,7 +1611,7 @@ def main():
             elif pool.data["agents"]:
                 selected_agent = pool.sample(strategy=args.opp_sample, topk=args.opp_topk, tau=args.opp_tau)
                 match_plan = [("pool", selected_agent)]
-                print(f"[pool] sample {args.opp_sample}: picked id={selected_agent['id']} elo={selected_agent['elo']:.1f}")
+                logger.info("[pool] sample %s: id=%s elo=%.1f", args.opp_sample, selected_agent["id"], selected_agent["elo"])
             
         except Exception as e:
             print(f"Pool sampling failed: {e}, using self-play")
@@ -1774,7 +1763,7 @@ def main():
                 meta={"env": args.env, "global_step": global_step, "seed": args.seed, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
             )
             pool.save()
-            print(f"[pool] updated {args.pool_path} with agent={agent_id}")
+            logger.info("[pool] updated %s with agent=%s", args.pool_path, agent_id)
         
         except Exception as e:
             print(f"Collection failed ({e}), skipping update")

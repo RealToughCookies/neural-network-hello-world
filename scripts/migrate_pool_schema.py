@@ -9,7 +9,7 @@ Usage:
 import argparse
 import json
 import sys
-from datetime import datetime
+import time
 from pathlib import Path
 
 # add project root (parent of 'scripts') to sys.path so 'src' is importable
@@ -32,14 +32,18 @@ def main():
         # Create minimal v1 skeleton
         pool = {
             "version": "v1-elo-pool",
-            "created_at": datetime.utcnow().isoformat() + "Z",
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "config": {"elo_k": 32, "scale": 400, "initial": 1200},
             "agents": []
         }
         pool_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(pool_path, "w") as f:
+        # Atomic write using temporary file + os.replace
+        import os
+        tmp_path = pool_path.with_suffix('.tmp')
+        with open(tmp_path, "w") as f:
             json.dump(pool, f, indent=2)
-        print(f"[pool] initialized new v1 pool at {pool_path}")
+        os.replace(tmp_path, pool_path)
+        print("[pool] initialized")
         return 0
     
     # Load existing pool
@@ -71,15 +75,19 @@ def main():
     else:
         output_path = pool_path.with_stem(pool_path.stem + "_v1")
     
-    with open(output_path, 'w') as f:
+    # Atomic write using temporary file + os.replace
+    import os
+    tmp_path = output_path.with_suffix('.tmp')
+    with open(tmp_path, 'w') as f:
         json.dump(v1_data, f, indent=2)
+    os.replace(tmp_path, output_path)
     
     print(f"Migrated pool saved to: {output_path}")
     
     if args.inplace:
-        print("[pool] migration complete - original file updated")
+        print("[pool] migrated legacy→v1-elo-pool")
     else:
-        print("[pool] migration complete - new file created")
+        print("[pool] migrated legacy→v1-elo-pool")
         print(f"To use: mv {output_path} {pool_path}")
     
     return 0
