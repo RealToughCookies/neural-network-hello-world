@@ -153,8 +153,8 @@ def main():
         
         # Define roles once - use adapter.agents if available
         roles = adapter.roles()  # dict mapping agent_name -> role
-        role_list = getattr(adapter, "agents", None) or list(roles.keys())
-        assert isinstance(role_list, (list, tuple)) and role_list, f"Adapter must expose role list; got {type(role_list)}"
+        agents = getattr(adapter, "agents", None) or adapter.agent_names()
+        assert isinstance(agents, (list, tuple)) and agents, f"Adapter must expose agent list; got {type(agents)}"
         
         # Initialize dimension adapters dict (for obs dimension mismatches)
         adapters = {}
@@ -165,12 +165,10 @@ def main():
         # Get observation dimensions and actions from adapter
         obs_dims = adapter.obs_dims()
         n_actions = adapter.n_actions()
-        agents = adapter.agent_names()
         print(f"[roles] {roles}")
-        print(f"[role_list] {role_list}")
+        print(f"[agents] {agents}")
         print(f"[obs_dims] {obs_dims}")
         print(f"[n_actions] {n_actions}")
-        print(f"[agents] {agents}")
         
     except ValueError as e:
         print(e)
@@ -306,12 +304,12 @@ def main():
     else:
         run_pool_buckets = True
         # ... run top-K/uniform/PFSP
-        agents = pool.data["agents"]
+        pool_agents = pool.data["agents"]
         pool_stats = {
-            'size': len(agents),
-            'qualified': len(agents), # all agents are qualified
-            'elo_mean': sum(a["elo"] for a in agents) / len(agents),
-            'elo_std': np.std([a["elo"] for a in agents]) if len(agents) > 1 else 0.0
+            'size': len(pool_agents),
+            'qualified': len(pool_agents), # all agents are qualified
+            'elo_mean': sum(a["elo"] for a in pool_agents) / len(pool_agents),
+            'elo_std': np.std([a["elo"] for a in pool_agents]) if len(pool_agents) > 1 else 0.0
         }
         print(f"[pool] loaded v1-elo-pool (agents={pool_stats['size']})")
         print(f"Pool Elo: mean={pool_stats['elo_mean']:.1f}, std={pool_stats['elo_std']:.1f}")
@@ -369,7 +367,7 @@ def main():
             print("3/6: vs top-K Elo...")
             topk_wins = 0
             topk_games = 0
-            k = min(5, len(pool.data["agents"]))
+            k = min(5, len(pool_agents))
             for i in range(k):
                 try:
                     agent = pool.sample(strategy="topk", topk=k)

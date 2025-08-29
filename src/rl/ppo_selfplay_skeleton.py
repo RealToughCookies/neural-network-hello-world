@@ -1739,7 +1739,7 @@ def main():
                 obs_norm_state={r: n.state_dict() for r, n in (norms or {}).items()} if args.obs_norm else None,
                 adv_norm_state=None,
                 rng_state=_capture_rng(),
-                counters={"global_step": global_step, "update_idx": updates_done, "episodes": updates_done},
+                counters={"global_step": global_step, "update_idx": updates_done, "episodes": updates_done * args.eval_eps},
                 meta={"env": args.env, "adapter": args.env, "seed": args.seed, "created_at": now_iso()}
             )
             save_checkpoint_v3(bundle, save_dir)
@@ -1760,14 +1760,15 @@ def main():
                 best_score = float('inf')  # mark as updated
             
             # Add/update agent in v1 Elo pool
-            agent_id = pool.add_or_update_agent(
-                ckpt_path=str((Path(args.save_dir) / "last.pt").resolve()),
-                ckpt_kind="v3",
-                roles=list(roles_set),
-                meta={"env": args.env, "global_step": global_step, "seed": args.seed, "created_at": now_iso()}
-            )
-            pool.save()
-            logger.info("[pool] updated %s with agent=%s", args.pool_path, agent_id)
+            if args.pool_path:
+                agent_id = pool.add_or_update_agent(
+                    ckpt_path=str((Path(args.save_dir) / "last.pt").resolve()),
+                    ckpt_kind="v3",
+                    roles=list(roles_set),
+                    meta={"env": args.env, "global_step": global_step, "seed": args.seed, "created_at": now_iso()}
+                )
+                pool.save()
+                logger.info("[pool] updated %s with agent=%s", args.pool_path, agent_id)
         
         except Exception as e:
             print(f"Collection failed ({e}), skipping update")
