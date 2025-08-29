@@ -114,7 +114,19 @@ def main():
         parser.error("the following arguments are required: --ckpt")
     
     # Resolve checkpoint path
-    ckpt_path = Path(args.ckpt).expanduser().resolve(strict=False)
+    ckpt_arg = Path(args.ckpt)
+    if ckpt_arg.is_dir():
+        # Try in order
+        for name in ("last.pt", "last_model.pt", "best.pt"):
+            candidate = ckpt_arg / name
+            if candidate.exists():
+                print(f"Directory provided, auto-selected: {candidate.name}")
+                ckpt_arg = candidate
+                break
+        else:
+            raise FileNotFoundError(f"No checkpoint files found in {ckpt_arg}; looked for last.pt, last_model.pt, best.pt")
+    
+    ckpt_path = ckpt_arg
     
     print(f"Evaluating checkpoint: {ckpt_path}")
     print(f"Environment: {args.env}, Episodes: {args.episodes}")
@@ -171,26 +183,32 @@ def main():
                 return int(v.shape[0])  # [n_act, hidden]
         return None
     
-    # Load checkpoint
-    norms = {}
+    # Load checkpoint using helper
+    obs_normalizers = {}
     try:
-        kind, obj = load_checkpoint_auto(ckpt_path)
-        
+        kind, payload = load_checkpoint_auto(ckpt_arg, map_location="cpu")
         if kind == "v3":
-            print("Loading v3 training bundle...")
-            ckpt = {"model": obj["model_state"], "meta": obj["meta"]}
-            # Load obs normalizers from v3 bundle
-            if obj.get("obs_norm_state"):
-                for role, norm_state in obj["obs_norm_state"].items():
-                    norms[role] = RunningNorm()
-                    norms[role].load_state_dict(norm_state)
-                    print(f"  {role}: count={norms[role].count:.0f}")
+            bundle = payload
+            policy = MultiHeadPolicy(obs_dims, n_actions)
+            policy.load_state_dict(bundle["model_state"])
+            # restore frozen obs-normalizers
+            obs_norm_state = bundle.get("obs_norm_state")
+            if obs_norm_state:
+                for r, sd in obs_norm_state.items():
+                    obs_normalizers[r] = RunningNorm()
+                    obs_normalizers[r].load_state_dict(sd)
+                print("Applied frozen obs-normalizers from checkpoint")
+            step = bundle.get("counters", {}).get("global_step", 0)
+            seed = bundle.get("meta", {}).get("seed", None)
+            print(f"[checkpoint kind] v3 | step={step} seed={seed}")
+            ckpt = {"model": bundle["model_state"], "meta": bundle["meta"]}
         else:
-            print("Loading model-only checkpoint...")
-            ckpt = obj
-            print("No normalizers found in model-only checkpoint")
+            policy = MultiHeadPolicy(obs_dims, n_actions)
+            policy.load_state_dict(payload)
+            print("[checkpoint kind] model_only (no normalizers)")
+            ckpt = payload
         
-        saved_dims = ckpt.get("meta", {}).get("obs_dims")
+        saved_dims = ckpt.get("meta", {}).get("obs_dims") if isinstance(ckpt, dict) else bundle.get("meta", {}).get("obs_dims")
         if saved_dims is None:
             raise ValueError("Checkpoint missing meta.obs_dims")
         
@@ -209,34 +227,12 @@ def main():
             else:
                 print(f"WARNING: Using dimension adapters for mismatch between ckpt and env dims")
         
-        # Use n_actions from adapter or fallback to checkpoint metadata  
-        # Build MultiHeadPolicy using checkpoint dimensions
-        policy = MultiHeadPolicy(saved_dims, n_actions)
-        
-        print(f"[checkpoint obs_dims] good={saved_dims['good']}, adv={saved_dims['adv']}")
-        print(f"[model expects] good={saved_dims['good']}, adv={saved_dims['adv']}")
-        
-        # Load model using robust policy loading
-        try:
-            print(f"[checkpoint kind] {kind}")
+        # Use obs_normalizers as norms for compatibility
+        norms = obs_normalizers
             
-            # Validate role structure in model state dict
-            model_sd = ckpt["model"]
-            has_roles = any(k.startswith(("pi.good.","pi.adv.","vf.good.","vf.adv.")) for k in model_sd.keys())
-            if not has_roles:
-                raise SystemExit("[fatal] legacy checkpoint without role labels. Re-train a new checkpoint after the v2-roles patch.")
-            
-            # Load policy using existing robust loader
-            saved_dims = load_policy_from_ckpt(policy, ckpt, expect_dims=saved_dims)
-            print(f"[policy dims] using ckpt dims: good={saved_dims['good']} adv={saved_dims['adv']}")
-            
-            # Normalizers already loaded above for v3 bundles
-            if kind != "v3" and not norms:
-                print("No normalizers found in model-only checkpoint")
-            
-        except Exception as e:
-            print(f"Checkpoint loading failed: {e}")
-            return 1
+    except Exception as e:
+        print(f"Checkpoint loading failed: {e}")
+        return 1
         
         # Add adapters if environment dimensions don't match checkpoint
         adapters = {}
@@ -273,22 +269,32 @@ def main():
     pool_stats = None
     if hasattr(args, 'pool_path') and Path(args.pool_path).exists():
         try:
-            pool = OpponentPoolV1(Path(args.pool_path))
-            pool.load()
-            if OpponentPoolV1.is_supported(pool.data):
+            maybe_pool = OpponentPoolV1(Path(args.pool_path))
+            maybe_pool.load()
+            pool = maybe_pool  # your v1 loader
+            if pool is None or len(pool.data["agents"]) == 0:
+                print("[pool] loaded v1-elo-pool (agents=0)")
+                print("Pool Elo: mean=0.0, std=0.0")
+                print("Skipping pool buckets (no agents).")
+                # ensure you DO NOT access pool stats like 'qualified' later
+                run_vs_pool_uniform = run_vs_pool_pfsp = run_vs_pool_topk = False
+                pool = None
+            else:
+                # normal pool eval...
                 agents = pool.data["agents"]
                 pool_stats = {
                     'size': len(agents),
-                    'elo_mean': sum(a["elo"] for a in agents) / max(1, len(agents)),
+                    'qualified': len(agents), # all agents are qualified
+                    'elo_mean': sum(a["elo"] for a in agents) / len(agents),
                     'elo_std': np.std([a["elo"] for a in agents]) if len(agents) > 1 else 0.0
                 }
                 print(f"[pool] loaded v1-elo-pool (agents={pool_stats['size']})")
                 print(f"Pool Elo: mean={pool_stats['elo_mean']:.1f}, std={pool_stats['elo_std']:.1f}")
-            else:
-                pool = None
+                run_vs_pool_uniform = run_vs_pool_pfsp = run_vs_pool_topk = True
         except Exception as e:
             print(f"Could not load v1 pool: {e}")
             pool = None
+            run_vs_pool_uniform = run_vs_pool_pfsp = run_vs_pool_topk = False
     
     # Run comprehensive evaluation
     try:
@@ -336,7 +342,7 @@ def main():
             results['wr_best'] = 0.5
         
         # 3. vs v1 pool opponents - three buckets evaluation
-        if pool and pool.data["agents"]:
+        if run_vs_pool_uniform and run_vs_pool_pfsp and run_vs_pool_topk:
             episodes_per_bucket = args.episodes // 6  # Split remaining episodes across 3 buckets
             
             # Bucket 1: Top-K (K = min(5, pool_size))

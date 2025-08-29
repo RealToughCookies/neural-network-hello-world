@@ -70,33 +70,21 @@ def make_bundle(
     }
 
 
-def save_checkpoint_v3(bundle: Dict[str, Any], save_dir: Path) -> Tuple[Path, Path]:
-    """
-    Writes:
-      - <save_dir>/last.pt  (full bundle)
-      - <save_dir>/last_model.pt (weights only)
-    Use tmp files + os.replace for atomicity.
-    """
-    save_dir = Path(save_dir)
+def save_checkpoint_v3(bundle: dict, save_dir: Path) -> tuple[Path, Path]:
     save_dir.mkdir(parents=True, exist_ok=True)
-    
-    bundle_path = save_dir / "last.pt"
-    model_path = save_dir / "last_model.pt"
-    
-    # Atomic save of v3 bundle
-    bundle_tmp = bundle_path.with_suffix(".tmp")
-    torch.save(bundle, bundle_tmp)
-    os.replace(bundle_tmp, bundle_path)
-    
-    # Extract and save model-only checkpoint
-    model_only = {
-        "model": bundle["model_state"],
-        "meta": bundle["meta"]
-    }
-    model_tmp = model_path.with_suffix(".tmp")
-    torch.save(model_only, model_tmp)
-    os.replace(model_tmp, model_path)
-    
+    # 1) Full bundle → last.pt (atomic)
+    bundle_path_tmp = save_dir / "last.pt.tmp"
+    bundle_path     = save_dir / "last.pt"
+    torch.save(bundle, bundle_path_tmp)
+    os.replace(bundle_path_tmp, bundle_path)
+
+    # 2) Weights-only → last_model.pt (atomic)
+    model_only = bundle["model_state"]
+    model_path_tmp = save_dir / "last_model.pt.tmp"
+    model_path     = save_dir / "last_model.pt"
+    torch.save(model_only, model_path_tmp)
+    os.replace(model_path_tmp, model_path)
+
     return bundle_path, model_path
 
 
