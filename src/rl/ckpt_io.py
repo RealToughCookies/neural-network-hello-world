@@ -70,58 +70,60 @@ def make_bundle(
     }
 
 
-def save_checkpoint_v3(bundle: dict, save_dir: Path) -> tuple[Path, Path]:
+def save_checkpoint_v3(bundle: dict, save_dir: Path):
     save_dir.mkdir(parents=True, exist_ok=True)
-    # 1) Full bundle → last.pt (atomic)
-    bundle_path_tmp = save_dir / "last.pt.tmp"
-    bundle_path     = save_dir / "last.pt"
-    torch.save(bundle, bundle_path_tmp)
-    os.replace(bundle_path_tmp, bundle_path)
 
-    # 2) Weights-only → last_model.pt (atomic)
+    # last.pt (bundle)
+    tmp = save_dir / "last.pt.tmp"
+    out = save_dir / "last.pt"
+    torch.save(bundle, tmp)
+    os.replace(tmp, out)
+
+    # last_model.pt (weights-only)
     model_only = bundle["model_state"]
-    model_path_tmp = save_dir / "last_model.pt.tmp"
-    model_path     = save_dir / "last_model.pt"
-    torch.save(model_only, model_path_tmp)
-    os.replace(model_path_tmp, model_path)
+    tmp = save_dir / "last_model.pt.tmp"
+    out = save_dir / "last_model.pt"
+    torch.save(model_only, tmp)
+    os.replace(tmp, out)
 
-    return bundle_path, model_path
+    return
 
 
-def load_checkpoint_auto(path_or_dir: Path, map_location: str = "cpu") -> Tuple[str, Union[Dict[str, Any], Dict[str, torch.Tensor]]]:
-    """
-    If directory: try last.pt → last_model.pt → best.pt.
-    If file: inspect object:
-      - dict with bundle["version"]==3 → ("v3", bundle)
-      - Tensor/dict of weights → ("model_only", state_dict)
-    """
-    path_or_dir = Path(path_or_dir)
-    
-    if path_or_dir.is_dir():
-        # Directory provided - try in preference order
-        candidates = ["last.pt", "last_model.pt", "best.pt"]
-        ckpt_path = None
-        for candidate in candidates:
-            candidate_path = path_or_dir / candidate
-            if candidate_path.exists():
-                ckpt_path = candidate_path
+def load_checkpoint_auto(path_or_dir: Path, map_location="cpu"):
+    p = Path(path_or_dir)
+    if p.is_dir():
+        for name in ("last.pt", "last_model.pt", "best.pt"):
+            cand = p / name
+            if cand.exists():
+                print(f"Directory provided, auto-selected: {cand.name}")
+                p = cand
                 break
-                
-        if ckpt_path is None:
-            raise FileNotFoundError(f"No suitable checkpoint found in {path_or_dir}")
-    else:
-        # File provided directly
-        if not path_or_dir.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {path_or_dir}")
-        ckpt_path = path_or_dir
-    
-    # Load checkpoint
-    obj = torch.load(ckpt_path, map_location=map_location, weights_only=False)
-    
-    # Determine checkpoint kind
-    if isinstance(obj, dict) and obj.get("version") == 3:
-        # v3 bundle
-        return "v3", obj
-    else:
-        # Model-only checkpoint or raw state dict
+        else:
+            raise FileNotFoundError(f"No checkpoint files found in {p}")
+
+    obj = torch.load(p, map_location=map_location, weights_only=False)
+
+    # v3 bundle detection (support multiple key names for BC)
+    if isinstance(obj, dict) and (
+        obj.get("version") == 3 or "model" in obj or "model_state" in obj
+    ):
+        # normalize shape
+        weights = obj.get("model_state") or obj.get("model") or obj.get("state_dict")
+        bundle = {
+            "version": obj.get("version", 3),
+            "model_state": weights,
+            "optim_state": obj.get("optim_state"),
+            "sched_state": obj.get("sched_state"),
+            "obs_norm_state": obj.get("obs_norm_state"),
+            "adv_norm_state": obj.get("adv_norm_state"),
+            "rng_state": obj.get("rng_state"),
+            "counters": obj.get("counters", {}),
+            "meta": obj.get("meta", {}),
+        }
+        return "v3", bundle
+
+    # plain weights (model-only)
+    if isinstance(obj, dict):
+        # common cases: a raw state_dict
         return "model_only", obj
+    raise ValueError(f"Unsupported checkpoint format at {p}")

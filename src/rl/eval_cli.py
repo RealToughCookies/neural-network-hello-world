@@ -185,30 +185,29 @@ def main():
     
     # Load checkpoint using helper
     obs_normalizers = {}
+    policy = MultiHeadPolicy(obs_dims, n_actions)
     try:
-        kind, payload = load_checkpoint_auto(ckpt_arg, map_location="cpu")
+        kind, payload = load_checkpoint_auto(Path(args.ckpt), map_location="cpu")
+
         if kind == "v3":
-            bundle = payload
-            policy = MultiHeadPolicy(obs_dims, n_actions)
-            policy.load_state_dict(bundle["model_state"])
-            # restore frozen obs-normalizers
-            obs_norm_state = bundle.get("obs_norm_state")
-            if obs_norm_state:
-                for r, sd in obs_norm_state.items():
+            b = payload
+            policy.load_state_dict(b["model_state"])
+            step = b.get("counters", {}).get("global_step", 0)
+            seed = b.get("meta", {}).get("seed")
+            print(f"[checkpoint kind] v3 | step={step} seed={seed}")
+
+            if b.get("obs_norm_state"):
+                for r, sd in b["obs_norm_state"].items():
                     obs_normalizers[r] = RunningNorm()
                     obs_normalizers[r].load_state_dict(sd)
                 print("Applied frozen obs-normalizers from checkpoint")
-            step = bundle.get("counters", {}).get("global_step", 0)
-            seed = bundle.get("meta", {}).get("seed", None)
-            print(f"[checkpoint kind] v3 | step={step} seed={seed}")
-            ckpt = {"model": bundle["model_state"], "meta": bundle["meta"]}
+            ckpt = {"model": b["model_state"], "meta": b["meta"]}
         else:
-            policy = MultiHeadPolicy(obs_dims, n_actions)
             policy.load_state_dict(payload)
             print("[checkpoint kind] model_only (no normalizers)")
             ckpt = payload
         
-        saved_dims = ckpt.get("meta", {}).get("obs_dims") if isinstance(ckpt, dict) else bundle.get("meta", {}).get("obs_dims")
+        saved_dims = ckpt.get("meta", {}).get("obs_dims") if isinstance(ckpt, dict) else None
         if saved_dims is None:
             raise ValueError("Checkpoint missing meta.obs_dims")
         
@@ -265,36 +264,37 @@ def main():
     rng = np.random.Generator(np.random.PCG64(args.seed))
     
     # Load v1 Elo pool if provided
-    pool = None
+    def load_pool_if_any(pool_path):
+        if hasattr(args, 'pool_path') and Path(pool_path).exists():
+            try:
+                pool = OpponentPoolV1(Path(pool_path))
+                pool.load()
+                return pool
+            except Exception as e:
+                print(f"Could not load v1 pool: {e}")
+                return None
+        return None
+
+    # --- pool handling ---
+    pool = load_pool_if_any(args.pool_path)  # your v1 loader
     pool_stats = None
-    if hasattr(args, 'pool_path') and Path(args.pool_path).exists():
-        try:
-            maybe_pool = OpponentPoolV1(Path(args.pool_path))
-            maybe_pool.load()
-            pool = maybe_pool  # your v1 loader
-            if pool is None or len(pool.data["agents"]) == 0:
-                print("[pool] loaded v1-elo-pool (agents=0)")
-                print("Pool Elo: mean=0.0, std=0.0")
-                print("Skipping pool buckets (no agents).")
-                # ensure you DO NOT access pool stats like 'qualified' later
-                run_vs_pool_uniform = run_vs_pool_pfsp = run_vs_pool_topk = False
-                pool = None
-            else:
-                # normal pool eval...
-                agents = pool.data["agents"]
-                pool_stats = {
-                    'size': len(agents),
-                    'qualified': len(agents), # all agents are qualified
-                    'elo_mean': sum(a["elo"] for a in agents) / len(agents),
-                    'elo_std': np.std([a["elo"] for a in agents]) if len(agents) > 1 else 0.0
-                }
-                print(f"[pool] loaded v1-elo-pool (agents={pool_stats['size']})")
-                print(f"Pool Elo: mean={pool_stats['elo_mean']:.1f}, std={pool_stats['elo_std']:.1f}")
-                run_vs_pool_uniform = run_vs_pool_pfsp = run_vs_pool_topk = True
-        except Exception as e:
-            print(f"Could not load v1 pool: {e}")
-            pool = None
-            run_vs_pool_uniform = run_vs_pool_pfsp = run_vs_pool_topk = False
+    if pool is None or len(pool.data["agents"]) == 0:
+        print("[pool] loaded v1-elo-pool (agents=0)")
+        print("Skipping pool buckets (no agents).")
+        run_pool_buckets = False
+    else:
+        run_pool_buckets = True
+        # normal pool eval...
+        agents = pool.data["agents"]
+        pool_stats = {
+            'size': len(agents),
+            'qualified': len(agents), # all agents are qualified
+            'elo_mean': sum(a["elo"] for a in agents) / len(agents),
+            'elo_std': np.std([a["elo"] for a in agents]) if len(agents) > 1 else 0.0
+        }
+        print(f"[pool] loaded v1-elo-pool (agents={pool_stats['size']})")
+        print(f"Pool Elo: mean={pool_stats['elo_mean']:.1f}, std={pool_stats['elo_std']:.1f}")
+        # run top-K/uniform/pfsp etc...
     
     # Run comprehensive evaluation
     try:
@@ -342,7 +342,7 @@ def main():
             results['wr_best'] = 0.5
         
         # 3. vs v1 pool opponents - three buckets evaluation
-        if run_vs_pool_uniform and run_vs_pool_pfsp and run_vs_pool_topk:
+        if run_pool_buckets:
             episodes_per_bucket = args.episodes // 6  # Split remaining episodes across 3 buckets
             
             # Bucket 1: Top-K (K = min(5, pool_size))

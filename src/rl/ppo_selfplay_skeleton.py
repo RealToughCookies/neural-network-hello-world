@@ -1738,9 +1738,8 @@ def main():
                 meta={"created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                       "env": args.env, "adapter": args.env, "seed": args.seed}
             )
-            bundle_path, model_path = save_checkpoint_v3(bundle, save_dir)
-            logger.info("[ckpt v3] wrote %s", bundle_path)
-            logger.info("[ckpt v3] wrote %s", model_path)
+            save_checkpoint_v3(bundle, save_dir)
+            logger.info("[ckpt v3] wrote last.pt and last_model.pt")
             
             # Evaluation gating for opponent pool and best checkpoint
             # Run simplified eval for gating (compute win rates)
