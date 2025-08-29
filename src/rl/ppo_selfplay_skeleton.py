@@ -34,6 +34,11 @@ import src.rl.adapters  # Import to register adapters
 N_ACT = 5  # Simple Adversary discrete actions: no-op, left, right, down, up
 
 
+def now_iso():
+    """Return current UTC time in ISO format."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
 def load_opponent_head(policy, entry):
     """Load opponent checkpoint and update the appropriate role head in policy."""
     if entry is None:
@@ -1735,7 +1740,7 @@ def main():
                 adv_norm_state=None,
                 rng_state=_capture_rng(),
                 counters={"global_step": global_step, "update_idx": updates_done, "episodes": updates_done},
-                meta={"env": args.env, "adapter": args.env, "seed": args.seed, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+                meta={"env": args.env, "adapter": args.env, "seed": args.seed, "created_at": now_iso()}
             )
             save_checkpoint_v3(bundle, save_dir)
             logger.info("[ckpt v3] wrote last.pt and last_model.pt")
@@ -1756,10 +1761,10 @@ def main():
             
             # Add/update agent in v1 Elo pool
             agent_id = pool.add_or_update_agent(
-                ckpt_path=str(save_dir / "last.pt"),
+                ckpt_path=str((Path(args.save_dir) / "last.pt").resolve()),
                 ckpt_kind="v3",
                 roles=list(roles_set),
-                meta={"env": args.env, "global_step": global_step, "seed": args.seed, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+                meta={"env": args.env, "global_step": global_step, "seed": args.seed, "created_at": now_iso()}
             )
             pool.save()
             logger.info("[pool] updated %s with agent=%s", args.pool_path, agent_id)
