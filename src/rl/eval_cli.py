@@ -151,10 +151,10 @@ def main():
             adapter.set_difficulty(args.dota_difficulty)
             print(f"Set difficulty to {args.dota_difficulty}")
         
-        # Define roles once
-        role_list = getattr(adapter, "agents", None) or list(adapter.roles().keys())
-        assert isinstance(role_list, (list, tuple)) and role_list, f"Adapter must expose role list; got {type(role_list)}"
+        # Define roles once - use adapter.agents if available
         roles = adapter.roles()  # dict mapping agent_name -> role
+        role_list = getattr(adapter, "agents", None) or list(roles.keys())
+        assert isinstance(role_list, (list, tuple)) and role_list, f"Adapter must expose role list; got {type(role_list)}"
         
         # Initialize dimension adapters dict (for obs dimension mismatches)
         adapters = {}
@@ -411,25 +411,72 @@ def main():
             for i in range(5):  # Sample 5 uniform opponents
                 try:
                     agent = pool.sample(strategy="uniform")
-                    # Similar evaluation logic...
-                    uniform_wins += 1 if random.random() < 0.5 else 0  # Placeholder
+                    kind, obj = load_checkpoint_auto(Path(agent["path"]))
+                    opp_policy = MultiHeadPolicy(saved_dims, n_actions)
+                    if kind == "v3":
+                        ckpt = {"model": obj["model_state"], "meta": obj["meta"]}
+                    else:
+                        ckpt = obj
+                    load_policy_from_ckpt(opp_policy, ckpt, expect_dims=saved_dims)
+                    
+                    # Temp opponent swap (assume learner=adv, opponent=good)
+                    original_good_state = policy.pi["good"].state_dict().copy()
+                    original_good_vf_state = policy.vf["good"].state_dict().copy()
+                    policy.pi["good"].load_state_dict(opp_policy.pi["good"].state_dict())
+                    policy.vf["good"].load_state_dict(opp_policy.vf["good"].state_dict())
+                    
+                    wr = run_episodes(policy, adapter, agents, roles, episodes=episodes_per_bucket, seed=args.seed + i + 3000, adapters=adapters, norms=norms)
+                    learner_wr = 1.0 - wr  # Learner is adv, so win when good loses
+                    if learner_wr > 0.5:
+                        uniform_wins += 1
                     uniform_games += 1
-                except Exception:
-                    pass
+                    
+                    # Restore
+                    policy.pi["good"].load_state_dict(original_good_state)
+                    policy.vf["good"].load_state_dict(original_good_vf_state)
+                    
+                    center, lower, upper = wilson(learner_wr, episodes_per_bucket)
+                    print(f"   vs {agent['id']} (elo={agent['elo']:.1f}): wr={learner_wr:.3f} (95% CI: [{lower:.3f}, {upper:.3f}])")
+                except Exception as e:
+                    print(f"   uniform failed: {e}")
             results['wr_pool_uniform'] = uniform_wins / uniform_games if uniform_games > 0 else 0.5
             
             # Bucket 3: PFSP-Elo
             print("5/6: vs pfsp_elo...")
             pfsp_wins = 0
             pfsp_games = 0
+            tau = getattr(args, 'opp_tau', 1.5)
             for i in range(5):  # Sample 5 PFSP opponents
                 try:
-                    agent = pool.sample(strategy="pfsp_elo", tau=1.5)
-                    # Similar evaluation logic...
-                    pfsp_wins += 1 if random.random() < 0.5 else 0  # Placeholder
+                    agent = pool.sample(strategy="pfsp_elo", tau=tau)
+                    kind, obj = load_checkpoint_auto(Path(agent["path"]))
+                    opp_policy = MultiHeadPolicy(saved_dims, n_actions)
+                    if kind == "v3":
+                        ckpt = {"model": obj["model_state"], "meta": obj["meta"]}
+                    else:
+                        ckpt = obj
+                    load_policy_from_ckpt(opp_policy, ckpt, expect_dims=saved_dims)
+                    
+                    # Temp opponent swap (assume learner=adv, opponent=good)
+                    original_good_state = policy.pi["good"].state_dict().copy()
+                    original_good_vf_state = policy.vf["good"].state_dict().copy()
+                    policy.pi["good"].load_state_dict(opp_policy.pi["good"].state_dict())
+                    policy.vf["good"].load_state_dict(opp_policy.vf["good"].state_dict())
+                    
+                    wr = run_episodes(policy, adapter, agents, roles, episodes=episodes_per_bucket, seed=args.seed + i + 4000, adapters=adapters, norms=norms)
+                    learner_wr = 1.0 - wr  # Learner is adv, so win when good loses
+                    if learner_wr > 0.5:
+                        pfsp_wins += 1
                     pfsp_games += 1
-                except Exception:
-                    pass
+                    
+                    # Restore
+                    policy.pi["good"].load_state_dict(original_good_state)
+                    policy.vf["good"].load_state_dict(original_good_vf_state)
+                    
+                    center, lower, upper = wilson(learner_wr, episodes_per_bucket)
+                    print(f"   vs {agent['id']} (elo={agent['elo']:.1f}): wr={learner_wr:.3f} (95% CI: [{lower:.3f}, {upper:.3f}])")
+                except Exception as e:
+                    print(f"   pfsp failed: {e}")
             results['wr_pool_prioritized'] = pfsp_wins / pfsp_games if pfsp_games > 0 else 0.5
             
         else:
