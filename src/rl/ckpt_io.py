@@ -73,41 +73,30 @@ def make_bundle(
 def save_checkpoint_v3(bundle: dict, save_dir: Path):
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    # last.pt (bundle)
-    tmp = save_dir / "last.pt.tmp"
-    out = save_dir / "last.pt"
-    torch.save(bundle, tmp)
-    os.replace(tmp, out)
+    # full bundle → last.pt (atomic)
+    tmp = save_dir / "last.pt.tmp"; out = save_dir / "last.pt"
+    torch.save(bundle, tmp); os.replace(tmp, out)
 
-    # last_model.pt (weights-only)
-    model_only = bundle["model_state"]
-    tmp = save_dir / "last_model.pt.tmp"
-    out = save_dir / "last_model.pt"
-    torch.save(model_only, tmp)
-    os.replace(tmp, out)
-
-    return
+    # weights-only → last_model.pt (atomic)
+    model_sd = bundle["model_state"]
+    tmp = save_dir / "last_model.pt.tmp"; out = save_dir / "last_model.pt"
+    torch.save(model_sd, tmp); os.replace(tmp, out)
 
 
 def load_checkpoint_auto(path_or_dir: Path, map_location="cpu"):
     p = Path(path_or_dir)
     if p.is_dir():
         for name in ("last.pt", "last_model.pt", "best.pt"):
-            cand = p / name
-            if cand.exists():
-                print(f"Directory provided, auto-selected: {cand.name}")
-                p = cand
-                break
+            q = p / name
+            if q.exists():
+                print(f"Directory provided, auto-selected: {q.name}")
+                p = q; break
         else:
             raise FileNotFoundError(f"No checkpoint files found in {p}")
 
     obj = torch.load(p, map_location=map_location, weights_only=False)
-
-    # v3 bundle detection (support multiple key names for BC)
-    if isinstance(obj, dict) and (
-        obj.get("version") == 3 or "model" in obj or "model_state" in obj
-    ):
-        # normalize shape
+    # v3-style bundle (be tolerant about keys)
+    if isinstance(obj, dict) and (obj.get("version") == 3 or "model_state" in obj or "model" in obj):
         weights = obj.get("model_state") or obj.get("model") or obj.get("state_dict")
         bundle = {
             "version": obj.get("version", 3),
@@ -122,8 +111,8 @@ def load_checkpoint_auto(path_or_dir: Path, map_location="cpu"):
         }
         return "v3", bundle
 
-    # plain weights (model-only)
+    # pure weights
     if isinstance(obj, dict):
-        # common cases: a raw state_dict
         return "model_only", obj
+
     raise ValueError(f"Unsupported checkpoint format at {p}")

@@ -142,8 +142,11 @@ def main():
         raise SystemExit(f"Checkpoint not found: {ckpt_path}\nDir contents: {listing}")
     
     # Create environment adapter
+    adapter = None  # single adapter instance
     try:
         adapter = make_adapter(args.env, render_mode=None)
+        # BC alias to avoid stray references
+        adapters = adapter
         
         # Set difficulty for dota_last_hit environment
         if hasattr(adapter, "set_difficulty"):
@@ -183,19 +186,18 @@ def main():
                 return int(v.shape[0])  # [n_act, hidden]
         return None
     
-    # Load checkpoint using helper
+    # Load checkpoint using helper  
+    device = "cpu"
     obs_normalizers = {}
     policy = MultiHeadPolicy(obs_dims, n_actions)
     try:
-        kind, payload = load_checkpoint_auto(Path(args.ckpt), map_location="cpu")
-
+        kind, payload = load_checkpoint_auto(Path(args.ckpt), map_location=device)
         if kind == "v3":
             b = payload
             policy.load_state_dict(b["model_state"])
             step = b.get("counters", {}).get("global_step", 0)
             seed = b.get("meta", {}).get("seed")
             print(f"[checkpoint kind] v3 | step={step} seed={seed}")
-
             if b.get("obs_norm_state"):
                 for r, sd in b["obs_norm_state"].items():
                     obs_normalizers[r] = RunningNorm()
@@ -275,16 +277,21 @@ def main():
                 return None
         return None
 
-    # --- pool handling ---
-    pool = load_pool_if_any(args.pool_path)  # your v1 loader
+    pool = load_pool_if_any(args.pool_path)  # returns OpponentPoolV1 | dict | None
+    def _num_agents(p):
+        if p is None: return 0
+        if hasattr(p, "agents"): return len(p.agents)
+        if isinstance(p, dict): return len(p.get("agents", []))
+        return 0
+
     pool_stats = None
-    if pool is None or len(pool.data["agents"]) == 0:
+    if _num_agents(pool) == 0:
         print("[pool] loaded v1-elo-pool (agents=0)")
         print("Skipping pool buckets (no agents).")
-        run_pool_buckets = False
+        run_pool = False
     else:
-        run_pool_buckets = True
-        # normal pool eval...
+        run_pool = True
+        # run top-K / uniform / pfsp buckets...
         agents = pool.data["agents"]
         pool_stats = {
             'size': len(agents),
@@ -294,7 +301,6 @@ def main():
         }
         print(f"[pool] loaded v1-elo-pool (agents={pool_stats['size']})")
         print(f"Pool Elo: mean={pool_stats['elo_mean']:.1f}, std={pool_stats['elo_std']:.1f}")
-        # run top-K/uniform/pfsp etc...
     
     # Run comprehensive evaluation
     try:
@@ -342,7 +348,7 @@ def main():
             results['wr_best'] = 0.5
         
         # 3. vs v1 pool opponents - three buckets evaluation
-        if run_pool_buckets:
+        if run_pool:
             episodes_per_bucket = args.episodes // 6  # Split remaining episodes across 3 buckets
             
             # Bucket 1: Top-K (K = min(5, pool_size))
