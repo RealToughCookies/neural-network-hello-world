@@ -1731,12 +1731,11 @@ def main():
                 model_state=policy.state_dict(),
                 optim_state={r: opt[r].state_dict() for r in opt},
                 sched_state={r: sched[r].state_dict() for r in sched} if sched else None,
-                obs_norm_state={r: norms[r].state_dict() for r in norms} if norms else None,
+                obs_norm_state={r: n.state_dict() for r, n in (norms or {}).items()} if args.obs_norm else None,
                 adv_norm_state=None,
                 rng_state=_capture_rng(),
                 counters={"global_step": global_step, "update_idx": updates_done, "episodes": updates_done},
-                meta={"created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                      "env": args.env, "adapter": args.env, "seed": args.seed}
+                meta={"env": args.env, "adapter": args.env, "seed": args.seed, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
             )
             save_checkpoint_v3(bundle, save_dir)
             logger.info("[ckpt v3] wrote last.pt and last_model.pt")

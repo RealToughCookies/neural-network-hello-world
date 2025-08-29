@@ -145,19 +145,26 @@ def main():
     adapter = None  # single adapter instance
     try:
         adapter = make_adapter(args.env, render_mode=None)
-        # BC alias to avoid stray references
-        adapters = adapter
         
         # Set difficulty for dota_last_hit environment
         if hasattr(adapter, "set_difficulty"):
             adapter.set_difficulty(args.dota_difficulty)
             print(f"Set difficulty to {args.dota_difficulty}")
+        
+        # Define roles once
+        roles = getattr(adapter, "agents", None)
+        if roles is None:
+            # fallback if your adapter exposes a mapping
+            roles = list(getattr(adapter, "roles", {}).keys())
+        assert roles and isinstance(roles, (list, tuple)), "Adapter must expose role list via .agents or .roles"
+        
+        # Right after you construct the adapter (temporary BC)
+        adapters = adapter  # avoid UnboundLocalError from stale name in branches
             
         adapter.reset(seed=args.seed)
         print(f"Created environment: {args.env}")
         
-        # Get role mapping and observation dimensions from adapter
-        roles = adapter.roles()
+        # Get observation dimensions and actions from adapter
         obs_dims = adapter.obs_dims()
         n_actions = adapter.n_actions()
         agents = adapter.agent_names()
@@ -238,7 +245,7 @@ def main():
         # Add adapters if environment dimensions don't match checkpoint
         adapters = {}
         if env_dims != saved_dims and args.allow_dim_adapter:
-            for role in ["good", "adv"]:
+            for role in roles:
                 env_dim = env_dims[role]
                 ckpt_dim = saved_dims[role]
                 if env_dim != ckpt_dim:
@@ -277,21 +284,21 @@ def main():
                 return None
         return None
 
-    pool = load_pool_if_any(args.pool_path)  # returns OpponentPoolV1 | dict | None
-    def _num_agents(p):
+    pool = load_pool_if_any(args.pool_path)  # your v1 loader
+    def num_agents(p):
         if p is None: return 0
         if hasattr(p, "agents"): return len(p.agents)
-        if isinstance(p, dict): return len(p.get("agents", []))
+        if isinstance(p, dict):  return len(p.get("agents", []))
         return 0
 
     pool_stats = None
-    if _num_agents(pool) == 0:
+    if num_agents(pool) == 0:
         print("[pool] loaded v1-elo-pool (agents=0)")
         print("Skipping pool buckets (no agents).")
-        run_pool = False
+        run_pool_buckets = False
     else:
-        run_pool = True
-        # run top-K / uniform / pfsp buckets...
+        run_pool_buckets = True
+        # ... run top-K/uniform/PFSP
         agents = pool.data["agents"]
         pool_stats = {
             'size': len(agents),
@@ -348,7 +355,7 @@ def main():
             results['wr_best'] = 0.5
         
         # 3. vs v1 pool opponents - three buckets evaluation
-        if run_pool:
+        if run_pool_buckets:
             episodes_per_bucket = args.episodes // 6  # Split remaining episodes across 3 buckets
             
             # Bucket 1: Top-K (K = min(5, pool_size))
