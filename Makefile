@@ -27,3 +27,8 @@ test-all:
 
 cov:
 	coverage html -d artifacts/htmlcov
+
+.PHONY: install-dev
+install-dev:
+	python -m pip install --upgrade pip
+	pip install -e .

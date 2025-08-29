@@ -1777,7 +1777,8 @@ def main():
             continue
     
     print(f"\n[done] Completed {args.updates} updates")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
