@@ -152,14 +152,12 @@ def main():
             print(f"Set difficulty to {args.dota_difficulty}")
         
         # Define roles once
-        roles = getattr(adapter, "agents", None)
-        if roles is None:
-            # fallback if your adapter exposes a mapping
-            roles = list(getattr(adapter, "roles", {}).keys())
-        assert roles and isinstance(roles, (list, tuple)), "Adapter must expose role list via .agents or .roles"
+        role_list = getattr(adapter, "agents", None) or list(adapter.roles().keys())
+        assert isinstance(role_list, (list, tuple)) and role_list, f"Adapter must expose role list; got {type(role_list)}"
+        roles = adapter.roles()  # dict mapping agent_name -> role
         
-        # Right after you construct the adapter (temporary BC)
-        adapters = adapter  # avoid UnboundLocalError from stale name in branches
+        # Initialize dimension adapters dict (for obs dimension mismatches)
+        adapters = {}
             
         adapter.reset(seed=args.seed)
         print(f"Created environment: {args.env}")
@@ -169,6 +167,7 @@ def main():
         n_actions = adapter.n_actions()
         agents = adapter.agent_names()
         print(f"[roles] {roles}")
+        print(f"[role_list] {role_list}")
         print(f"[obs_dims] {obs_dims}")
         print(f"[n_actions] {n_actions}")
         print(f"[agents] {agents}")
@@ -234,6 +233,14 @@ def main():
                 )
             else:
                 print(f"WARNING: Using dimension adapters for mismatch between ckpt and env dims")
+        
+        # Add "tripwire" assertions where it matters
+        def _assert_is_mapping(name, obj):
+            import collections.abc
+            assert isinstance(obj, collections.abc.Mapping), f"{name} must be a dict-like mapping, got {type(obj)}"
+        
+        _assert_is_mapping("obs_normalizers", obs_normalizers)
+        assert isinstance(obs_normalizers, dict), f"obs_normalizers is {type(obs_normalizers)}; did you forget to call the factory?"
         
         # Use obs_normalizers as norms for compatibility
         norms = obs_normalizers
