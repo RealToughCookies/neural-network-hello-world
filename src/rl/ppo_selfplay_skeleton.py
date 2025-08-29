@@ -1431,6 +1431,10 @@ def main():
     
     args = parser.parse_args()
     
+    # CLI hygiene: warn about steps vs rollout_steps confusion
+    if hasattr(args, "steps") and args.steps and args.steps < args.rollout_steps:
+        logger.warning("--steps < --rollout-steps; train loop steps do not cap rollout budget")
+    
     # Set up save directory
     from pathlib import Path
     save_dir = Path(args.save_dir)
@@ -1648,8 +1652,6 @@ def main():
                 match_plan=match_plan,
                 load_opponent=load_opponent_head,
             )
-            
-            logger.info("[collector] adapter_native | per-agent steps: %s", ", ".join(f"{r}={counts[r]}" for r in sorted(counts)))
             
             # Record game result for v1 Elo pool
             if selected_agent and match_plan[0][0] == "pool":

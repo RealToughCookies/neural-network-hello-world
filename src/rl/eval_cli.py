@@ -101,6 +101,20 @@ def main():
                        help='Allow dimension adapter for obs dim mismatches')
     parser.add_argument("--dota-difficulty", type=float, default=2.0,
                         help="Difficulty level (0..3) for dota_last_hit eval")
+    parser.add_argument(
+        "--opp-sample",
+        choices=["uniform", "topk", "pfsp_elo"],
+        default="pfsp_elo",
+        help="Opponent sampling strategy for pool buckets."
+    )
+    parser.add_argument(
+        "--opp-topk", type=int, default=5,
+        help="K for top-k sampling when --opp-sample=topk (or for a top-K bucket)."
+    )
+    parser.add_argument(
+        "--opp-tau", type=float, default=1.5,
+        help="Tau for PFSP-elo weighting (higher = softer focus)."
+    )
     args = parser.parse_args()
     
     # Handle list-envs option
@@ -297,7 +311,8 @@ def main():
         return 0
 
     pool_stats = None
-    if num_agents(pool) == 0:
+    n_agents = len(pool.data["agents"]) if (pool and hasattr(pool, "data") and "agents" in pool.data) else 0
+    if n_agents == 0:
         print("[pool] loaded v1-elo-pool (agents=0)")
         print("Skipping pool buckets (no agents).")
         run_pool_buckets = False
@@ -363,14 +378,14 @@ def main():
         if run_pool_buckets:
             episodes_per_bucket = args.episodes // 6  # Split remaining episodes across 3 buckets
             
-            # Bucket 1: Top-K (K = min(5, pool_size))
-            print("3/6: vs top-K Elo...")
+            # Bucket 1: Top-K (K = min(args.opp_topk, n_agents))
+            K = min(args.opp_topk, n_agents)
+            print(f"3/6: vs top-{K} Elo...")
             topk_wins = 0
             topk_games = 0
-            k = min(5, len(pool_agents))
-            for i in range(k):
+            for i in range(K):
                 try:
-                    agent = pool.sample(strategy="topk", topk=k)
+                    agent = pool.sample(strategy="topk", topk=K)
                     kind, obj = load_checkpoint_auto(Path(agent["path"]))
                     opp_policy = MultiHeadPolicy(saved_dims, n_actions)
                     if kind == "v3":
@@ -403,10 +418,10 @@ def main():
             results['wr_topk'] = topk_wins / topk_games if topk_games > 0 else 0.5
             
             # Bucket 2: Uniform 
-            print("4/6: vs uniform...")
+            print(f"4/6: vs uniform (N={K})...")
             uniform_wins = 0
             uniform_games = 0
-            for i in range(5):  # Sample 5 uniform opponents
+            for i in range(K):  # Sample K uniform opponents
                 try:
                     agent = pool.sample(strategy="uniform")
                     kind, obj = load_checkpoint_auto(Path(agent["path"]))
@@ -440,13 +455,12 @@ def main():
             results['wr_pool_uniform'] = uniform_wins / uniform_games if uniform_games > 0 else 0.5
             
             # Bucket 3: PFSP-Elo
-            print("5/6: vs pfsp_elo...")
+            print(f"5/6: vs pfsp_elo (tau={args.opp_tau})...")
             pfsp_wins = 0
             pfsp_games = 0
-            tau = getattr(args, 'opp_tau', 1.5)
-            for i in range(5):  # Sample 5 PFSP opponents
+            for i in range(K):  # Sample K PFSP opponents
                 try:
-                    agent = pool.sample(strategy="pfsp_elo", tau=tau)
+                    agent = pool.sample(strategy="pfsp_elo", tau=args.opp_tau)
                     kind, obj = load_checkpoint_auto(Path(agent["path"]))
                     opp_policy = MultiHeadPolicy(saved_dims, n_actions)
                     if kind == "v3":

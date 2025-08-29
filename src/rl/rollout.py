@@ -59,7 +59,7 @@ def collect_rollouts(
     rng = np.random.default_rng(seed)
 
     def need_more() -> bool:
-        return any(counts[r] < per_agent_steps for r in counts)
+        return min(counts.values()) < per_agent_steps
 
     while need_more():
         # select match
@@ -74,53 +74,58 @@ def collect_rollouts(
         ts = adapter.reset(seed=seed + episode_idx)
         episode_idx += 1
 
-        # per-episode ep buffers for GAE
-        ep_obs   = {ag: [] for ag in agents}
-        ep_act   = {ag: [] for ag in agents}
-        ep_logp  = {ag: [] for ag in agents}
-        ep_val   = {ag: [] for ag in agents}
-        ep_rew   = {ag: [] for ag in agents}
-        ep_done  = {ag: [] for ag in agents}
-
-        while not all(ts.dones.values()):
+        # Step-by-step collection with agent-step counting
+        while not all(ts.dones.values()) and need_more():
             actions = {}
+            step_data = {}  # Store data for this step
+            
+            # Generate actions for all active agents
             for ag in agents:
-                role = roles[ag]
-                o = ts.obs[ag]
-                if role in obs_tf:
-                    o = obs_tf[role](o)
-                ep_obs[ag].append(o.copy())
-                o_t = torch.from_numpy(o.astype(np.float32)).unsqueeze(0)
-                logits = policy.act(role, o_t)
-                probs = torch.softmax(logits, dim=-1)
-                # sample (stochastic policy during rollout)
-                dist = torch.distributions.Categorical(probs=probs)
-                a = int(dist.sample().item())
-                lp = float(dist.log_prob(torch.tensor(a)).item())
-                v = float(policy.value(role, o_t).item())
-                actions[ag] = a
-                ep_act[ag].append(a); ep_logp[ag].append(lp); ep_val[ag].append(v)
-            ts = adapter.step(actions)
-            for ag in agents:
-                ep_rew[ag].append(float(ts.rewards[ag]))
-                ep_done[ag].append(bool(ts.dones[ag]))
-
-        # push completed episode into role trajs
-        for ag in agents:
-            role = roles[ag]
-            # only add until we reach the per-agent budget (truncate tail if needed)
-            rem = per_agent_steps - counts[role]
-            if rem <= 0: 
-                continue
-            take = min(rem, len(ep_act[ag]))
-            sl = slice(0, take)
-            bufs[role].obs.extend(ep_obs[ag][sl])
-            bufs[role].act.extend(ep_act[ag][sl])
-            bufs[role].logp.extend(ep_logp[ag][sl])
-            bufs[role].val.extend(ep_val[ag][sl])
-            bufs[role].rew.extend(ep_rew[ag][sl])
-            bufs[role].done.extend(ep_done[ag][sl])
-            counts[role] += take
+                if ag in ts.obs and not ts.dones.get(ag, True):  # Agent is alive
+                    role = roles[ag]
+                    o = ts.obs[ag]
+                    if role in obs_tf:
+                        o = obs_tf[role](o)
+                    
+                    o_t = torch.from_numpy(o.astype(np.float32)).unsqueeze(0)
+                    logits = policy.act(role, o_t)
+                    probs = torch.softmax(logits, dim=-1)
+                    # sample (stochastic policy during rollout)
+                    dist = torch.distributions.Categorical(probs=probs)
+                    a = int(dist.sample().item())
+                    lp = float(dist.log_prob(torch.tensor(a)).item())
+                    v = float(policy.value(role, o_t).item())
+                    
+                    actions[ag] = a
+                    step_data[ag] = {
+                        'obs': o.copy(),
+                        'act': a,
+                        'logp': lp,
+                        'val': v,
+                        'role': role
+                    }
+            
+            # Step environment
+            next_ts = adapter.step(actions)
+            
+            # Store transitions for agents that were active and haven't reached target
+            for ag, data in step_data.items():
+                role = data['role']
+                if counts[role] < per_agent_steps:  # Only if we need more steps for this role
+                    bufs[role].obs.append(data['obs'])
+                    bufs[role].act.append(data['act'])
+                    bufs[role].logp.append(data['logp'])
+                    bufs[role].val.append(data['val'])
+                    bufs[role].rew.append(float(next_ts.rewards.get(ag, 0.0)))
+                    bufs[role].done.append(bool(next_ts.dones.get(ag, False)))
+                    counts[role] += 1  # Increment agent-step count
+            
+            ts = next_ts
+            
+            # Reset if episode ends but we still need more steps
+            if all(ts.dones.values()) and need_more():
+                ts = adapter.reset(seed=seed + episode_idx)
+                episode_idx += 1
 
     # compute per-role GAE/returns
     adv_out: Dict[str, torch.Tensor] = {}
@@ -158,4 +163,11 @@ def collect_rollouts(
         logp_out[role] = logp_t
         val_out[role] = val_t
 
+    # Log and assert exact budget fulfillment
+    import logging
+    logger = logging.getLogger(__name__)
+    msg = ", ".join(f"{r}={counts[r]}" for r in sorted(counts))
+    logger.info("[collector] adapter_native | per-agent steps: %s", msg)
+    assert all(counts[r] == per_agent_steps for r in counts), f"collector budget miss: {counts} vs target={per_agent_steps}"
+    
     return Batch(obs=obs_out, act=act_out, logp=logp_out, val=val_out, adv=adv_out, ret=ret_out), counts
