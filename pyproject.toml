@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neural-network-hello-world"
+version = "0.0.0"
+requires-python = ">=3.10"
+
+[project.scripts]
+eval_cli = "src.rl.eval_cli:main"
+ppo_train = "src.rl.ppo_selfplay_skeleton:main"
+migrate_pool_schema = "scripts.migrate_pool_schema:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "scripts*"]

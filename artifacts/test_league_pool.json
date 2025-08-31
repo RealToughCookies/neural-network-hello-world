@@ -1,0 +1,26 @@
+{
+  "schema": 2,
+  "env": "mpe_adversary",
+  "roles": ["good", "adv"],
+  "agents": [
+    {
+      "policy_id": "test_agent_1:good",
+      "role": "good", 
+      "ckpt": "artifacts/rl_ckpts/test1.pt",
+      "elo": 1100.0,
+      "games": 10,
+      "wins": 6,
+      "created": "2024-01-01T00:00:00Z"
+    },
+    {
+      "policy_id": "test_agent_2:adv",
+      "role": "adv",
+      "ckpt": "artifacts/rl_ckpts/test2.pt", 
+      "elo": 950.0,
+      "games": 8,
+      "wins": 3,
+      "created": "2024-01-01T00:00:00Z"
+    }
+  ],
+  "matches": []
+}

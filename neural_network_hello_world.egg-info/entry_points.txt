@@ -1,0 +1,4 @@
+[console_scripts]
+eval_cli = src.rl.eval_cli:main
+migrate_pool_schema = scripts.migrate_pool_schema:main
+ppo_train = src.rl.ppo_selfplay_skeleton:main

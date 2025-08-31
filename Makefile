@@ -17,3 +17,18 @@ tune:
 
 clean:
 	rm -rf artifacts
+
+.PHONY: test test-all cov
+test:
+	pytest -m "unit or smoke" --cov=src --cov-report=term-missing
+
+test-all:
+	pytest -m "unit or smoke or rl or cli" --cov=src --cov-report=xml:artifacts/coverage.xml --cov-report=term
+
+cov:
+	coverage html -d artifacts/htmlcov
+
+.PHONY: install-dev
+install-dev:
+	python -m pip install --upgrade pip
+	pip install -e .

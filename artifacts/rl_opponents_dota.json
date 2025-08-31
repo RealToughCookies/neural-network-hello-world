@@ -1,0 +1,10 @@
+{
+  "version": "v1-elo-pool",
+  "created_at": "2025-08-28T19:17:07Z",
+  "config": {
+    "elo_k": 32,
+    "scale": 400,
+    "initial": 1200
+  },
+  "agents": []
+}
