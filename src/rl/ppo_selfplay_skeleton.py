@@ -1466,7 +1466,9 @@ def main():
     # League/opponent sampling arguments  
     parser.add_argument("--league-frac", type=float, default=0.0,
                        help="Fraction of episodes to use league opponents vs self-play")
-    parser.add_argument("--league-strategy", choices=["uniform", "topk", "pfsp"], default="uniform",
+    parser.add_argument("--league-strategy", "--selfplay-sampler", 
+                       dest="league_strategy",
+                       choices=["uniform", "topk", "pfsp"], default="uniform",
                        help="League opponent sampling strategy")
     parser.add_argument("--selfplay-topk", type=int, default=5,
                        help="Top-K for topk league sampling")
