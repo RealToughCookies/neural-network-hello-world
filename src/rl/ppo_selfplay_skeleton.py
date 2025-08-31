@@ -28,7 +28,7 @@ from src.rl.env_api import make_adapter
 from src.rl.checkpoint import save_checkpoint, load_policy_from_ckpt, load_legacy_checkpoint, save_bundle, load_bundle
 from src.rl.ckpt_io import make_bundle, save_checkpoint_v3, load_checkpoint_auto, _capture_rng, _restore_rng
 from src.rl.elo_pool import OpponentPoolV1
-from src.rl.opponent_pool import load_pool, save_pool, register_snapshot
+from src.rl.opponent_pool import load_pool, save_pool, register_snapshot, sample_uniform, sample_topk, sample_pfsp_elo
 from src.rl.rollout import collect_rollouts
 import src.rl.adapters  # Import to register adapters
 
@@ -46,23 +46,52 @@ def load_opponent_head(policy, entry):
         return
     
     try:
+        # Handle different entry formats (v1 pool vs league pool)
+        if hasattr(entry, 'ckpt_path'):
+            # v1 pool format
+            ckpt_path = entry.ckpt_path
+            role = getattr(entry, 'role', 'good')
+            entry_id = getattr(entry, 'id', 'unknown')
+        elif isinstance(entry, dict):
+            # League pool format  
+            ckpt_path = entry.get('ckpt')
+            role = entry.get('role', 'good')
+            entry_id = entry.get('policy_id', 'unknown')
+        else:
+            print(f"Warning: Unknown entry format: {type(entry)}")
+            return
+            
+        if not ckpt_path:
+            print(f"Warning: No checkpoint path for opponent {entry_id}")
+            return
+        
         # Load opponent checkpoint
-        opp_ckpt = torch.load(entry.ckpt_path, map_location="cpu", weights_only=False)
+        opp_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         opp_policy = MultiHeadPolicy(policy.obs_dims, N_ACT)
         load_policy_from_ckpt(opp_policy, opp_ckpt, expect_dims=policy.obs_dims)
         
-        # Load opponent head based on entry role
-        if entry.role == "good":
+        # Load opponent head based on entry role - freeze parameters
+        if role == "good":
             policy.pi["good"].load_state_dict(opp_policy.pi["good"].state_dict())
             policy.vf["good"].load_state_dict(opp_policy.vf["good"].state_dict())
-        elif entry.role == "adv":
+            # Freeze opponent parameters
+            for param in policy.pi["good"].parameters():
+                param.requires_grad = False
+            for param in policy.vf["good"].parameters():
+                param.requires_grad = False
+        elif role == "adv":
             policy.pi["adv"].load_state_dict(opp_policy.pi["adv"].state_dict())
             policy.vf["adv"].load_state_dict(opp_policy.vf["adv"].state_dict())
+            # Freeze opponent parameters  
+            for param in policy.pi["adv"].parameters():
+                param.requires_grad = False
+            for param in policy.vf["adv"].parameters():
+                param.requires_grad = False
         else:
-            print(f"Warning: Unknown role '{entry.role}' for opponent {entry.id}")
+            print(f"Warning: Unknown role '{role}' for opponent {entry_id}")
             
     except Exception as e:
-        print(f"Failed to load opponent head for {entry.id}: {e}")
+        print(f"Failed to load opponent head for {entry_id}: {e}")
 
 
 def _role_batch_view(batch, role):
@@ -264,6 +293,47 @@ def _select_opponent(pool, pi_good, pi_adv, vf_good, vf_adv,
     opp_vf_adv.load_state_dict(vf_adv.state_dict())
     
     return opp_pi_good, opp_pi_adv, opp_vf_good, opp_vf_adv, "self_fallback", None
+
+
+def pick_opponent_ckpt(pool, role, strategy, *, topk, mode, p, agent_elo, rng):
+    """
+    Pick opponent checkpoint from pool using specified strategy.
+    
+    Args:
+        pool: Pool dictionary from load_pool()
+        role: Role to sample from ("good" or "adv")
+        strategy: Sampling strategy ("uniform", "topk", "pfsp")
+        topk: Number of top agents for topk strategy
+        mode: PFSP mode ("hard", "even", "easy")
+        p: PFSP power parameter
+        agent_elo: Current agent Elo for PFSP
+        rng: Random number generator
+        
+    Returns:
+        Tuple of (checkpoint_path, agent_dict) or (None, None) if no agents
+    """
+    if not pool or not pool.get("agents"):
+        return None, None
+    
+    try:
+        if strategy == "uniform":
+            items = sample_uniform(pool, role, n=1, rng=rng)
+        elif strategy == "topk":
+            items = sample_topk(pool, role, k=topk, n=1, rng=rng)  
+        elif strategy == "pfsp":
+            items = sample_pfsp_elo(pool, role, agent_elo, mode=mode, p=p, n=1, rng=rng)
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
+        
+        if not items:
+            return None, None
+            
+        agent = items[0]
+        return agent["ckpt"], agent
+        
+    except Exception as e:
+        logger.warning("Failed to sample opponent: %s", e)
+        return None, None
 
 
 class MockEnvironment:
@@ -1393,6 +1463,22 @@ def main():
     parser.add_argument("--gate-pool-min-wr", type=float, default=0.52,
                        help="Minimum uniform pool win rate to add to pool")
     
+    # League/opponent sampling arguments  
+    parser.add_argument("--league-frac", type=float, default=0.0,
+                       help="Fraction of episodes to use league opponents vs self-play")
+    parser.add_argument("--league-strategy", choices=["uniform", "topk", "pfsp"], default="uniform",
+                       help="League opponent sampling strategy")
+    parser.add_argument("--selfplay-topk", type=int, default=5,
+                       help="Top-K for topk league sampling")
+    parser.add_argument("--selfplay-pfsp-mode", choices=["hard", "even", "easy"], default="even",
+                       help="PFSP mode for league sampling (hard=strong opponents, even=balanced, easy=weak opponents)")
+    parser.add_argument("--selfplay-pfsp-p", type=float, default=2.0,
+                       help="PFSP power parameter for league sampling")
+    parser.add_argument("--agent-elo", type=float, default=1000.0,
+                       help="Current agent's Elo rating for PFSP calculations")
+    parser.add_argument("--pool-path-league", type=str, default="artifacts/league_pool.json",
+                       help="Path to league opponent pool JSON file")
+    
     # Dimension handling arguments
     parser.add_argument('--allow-dim-adapter', action='store_true', default=False,
                        help='Allow dimension adapter for obs dim mismatches')
@@ -1517,10 +1603,27 @@ def main():
     
     logger.info("[pool] loaded v1-elo-pool (agents=%d)", len(pool.data['agents']))
     
+    # Initialize league opponent pool
+    league_pool = None
+    league_stats = {"counts": {}, "elo_stats": {}, "selections": {}}
+    if args.league_frac > 0.0:
+        try:
+            league_pool = load_pool(Path(args.pool_path_league))
+            league_agents = league_pool.get("agents", [])
+            logger.info("[league] loaded pool (agents=%d)", len(league_agents))
+            if league_agents:
+                league_stats["elo_stats"] = {
+                    "mean": sum(a["elo"] for a in league_agents) / len(league_agents),
+                    "std": np.std([a["elo"] for a in league_agents]) if len(league_agents) > 1 else 0.0
+                }
+        except Exception as e:
+            logger.warning("[league] failed to load pool: %s", e)
+            league_pool = None
+    
     # Create MultiHeadPolicy and per-role optimizers/schedulers
     policy = MultiHeadPolicy(obs_dims, N_ACT)
     
-    roles_set = sorted(set(roles.values()))  # e.g., ["adv", "good"]
+    roles_set = sorted(set(role_of.values()))  # e.g., ["adv", "good"]
     
     # Create per-role optimizers/schedulers
     opt = {r: torch.optim.Adam(
@@ -1531,6 +1634,7 @@ def main():
     
     global_step = 0
     updates_done = 0
+    start_update = 0
     
     # Resume logic
     if args.resume:
@@ -1611,23 +1715,70 @@ def main():
         if args.curriculum != "off":
             print(f"Curriculum: progress={progress:.3f}, level={lvl:.2f}")
         
-        # Sample opponent using v1 Elo pool
+        # Sample opponent using league or v1 Elo pool
         selected_agent = None
+        league_opponent = None
         match_plan = [("self", None)]  # Default to self-play
+        source = "mirror"
         
-        try:
-            # Sample opponent based on strategy (with some self-play mix)
-            if random.random() < args.opp_min_selfplay_frac:
-                # Force self-play
-                pass
-            elif pool.data["agents"]:
-                selected_agent = pool.sample(strategy=args.opp_sample, topk=args.opp_topk, tau=args.opp_tau)
-                match_plan = [("pool", selected_agent)]
-                logger.info("[pool] sample %s: id=%s elo=%.1f", args.opp_sample, selected_agent["id"], selected_agent["elo"])
+        # League opponent sampling (if enabled and probability hits)
+        if args.league_frac > 0.0 and random.random() < args.league_frac:
+            # Try to get current agent Elo from league pool
+            current_agent_elo = args.agent_elo
+            if league_pool:
+                # Try to find current agent in pool based on checkpoint
+                current_ckpt = str((save_dir / "last.pt").resolve())
+                for agent in league_pool.get("agents", []):
+                    if agent.get("ckpt") == current_ckpt:
+                        current_agent_elo = agent.get("elo", args.agent_elo)
+                        break
             
-        except Exception as e:
-            print(f"Pool sampling failed: {e}, using self-play")
-            match_plan = [("self", None)]
+            # Sample league opponent for each role pair
+            for role in ["good", "adv"]:
+                opponent_role = "adv" if role == "good" else "good"
+                ckpt_path, agent = pick_opponent_ckpt(
+                    league_pool, opponent_role, args.league_strategy,
+                    topk=args.selfplay_topk, mode=args.selfplay_pfsp_mode,
+                    p=args.selfplay_pfsp_p, agent_elo=current_agent_elo, rng=rng
+                )
+                
+                if ckpt_path and agent:
+                    league_opponent = agent
+                    match_plan = [("league", agent)]
+                    source = f"league_{args.league_strategy}"
+                    
+                    # Track selections for logging
+                    policy_id = agent.get("policy_id", "unknown")
+                    league_stats["selections"][policy_id] = league_stats["selections"].get(policy_id, 0) + 1
+                    league_stats["counts"][source] = league_stats["counts"].get(source, 0) + 1
+                    
+                    logger.info("[league] sample %s: role=%s id=%s elo=%.1f", 
+                               args.league_strategy, opponent_role, policy_id, agent.get("elo", 0))
+                    break
+        
+        # Fallback to v1 Elo pool if no league opponent
+        if not league_opponent:
+            try:
+                # Sample opponent based on strategy (with some self-play mix)
+                if random.random() < args.opp_min_selfplay_frac:
+                    # Force self-play
+                    source = "mirror"
+                    league_stats["counts"]["mirror"] = league_stats["counts"].get("mirror", 0) + 1
+                elif pool.data["agents"]:
+                    selected_agent = pool.sample(strategy=args.opp_sample, topk=args.opp_topk, tau=args.opp_tau)
+                    match_plan = [("pool", selected_agent)]
+                    source = f"pool_{args.opp_sample}"
+                    league_stats["counts"][source] = league_stats["counts"].get(source, 0) + 1
+                    logger.info("[pool] sample %s: id=%s elo=%.1f", args.opp_sample, selected_agent["id"], selected_agent["elo"])
+                else:
+                    source = "mirror"
+                    league_stats["counts"]["mirror"] = league_stats["counts"].get("mirror", 0) + 1
+                
+            except Exception as e:
+                print(f"Pool sampling failed: {e}, using self-play")
+                match_plan = [("self", None)]
+                source = "mirror"
+                league_stats["counts"]["mirror"] = league_stats["counts"].get("mirror", 0) + 1
         
         # Build observation transform from norms if enabled
         obs_tf = {}
@@ -1645,7 +1796,7 @@ def main():
             batch, counts = collect_rollouts(
                 adapter=adapter,
                 policy=policy,
-                roles=roles,
+                roles=role_of,
                 agents=agents,
                 per_agent_steps=args.rollout_steps,
                 seed=args.seed + update_idx * 1000,
@@ -1717,6 +1868,33 @@ def main():
                 except Exception as e:
                     print(f"Evaluation failed: {e}")
             
+            # League statistics logging (once per epoch)
+            if args.league_frac > 0.0 and (update_idx + 1) % 10 == 0:  # Log every 10 updates
+                print("\n=== League Statistics ===")
+                for role in ["good", "adv"]:
+                    print(f"{role.upper()} role:")
+                    print(f"  Strategy: {args.league_strategy}")
+                    
+                    # Counts by source
+                    total_counts = sum(league_stats["counts"].values())
+                    if total_counts > 0:
+                        for src, count in league_stats["counts"].items():
+                            pct = 100.0 * count / total_counts
+                            print(f"  {src}: {count} ({pct:.1f}%)")
+                    
+                    # Opponent Elo stats
+                    if "elo_stats" in league_stats and league_stats["elo_stats"]:
+                        mean_elo = league_stats["elo_stats"].get("mean", 0)
+                        std_elo = league_stats["elo_stats"].get("std", 0)
+                        print(f"  Avg opponent Elo: {mean_elo:.1f} ± {std_elo:.1f}")
+                    
+                    # Top 5 selected agents
+                    if league_stats["selections"]:
+                        top_selections = sorted(league_stats["selections"].items(), 
+                                              key=lambda x: x[1], reverse=True)[:5]
+                        print(f"  Top selections: {', '.join(f'{pid}({count})' for pid, count in top_selections)}")
+                print("=" * 26)
+            
             # Always log to CSV with stable header (use per-role stats)
             kl_g = stats.get("good", {}).get("kl", 0.0)
             kl_a = stats.get("adv", {}).get("kl", 0.0)
@@ -1725,7 +1903,7 @@ def main():
             
             row = [int(update_idx + 1), float(kl_g), float(kl_a), 
                    float(ent_g), float(ent_a), float(eval_g), float(eval_a), 
-                   picks[0][0] if picks else "self"]  # Use match plan source
+                   source]  # Use actual match source
             _append_csv("artifacts/rl_metrics.csv", CSV_HEADER, row)
             print(f"[csv] logged to rl_metrics.csv")
             
