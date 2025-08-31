@@ -22,7 +22,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest pytest-timeout coverage
+          pip install pytest pytest-timeout pytest-cov coverage
       - name: Headless env
         run: |
           echo "SDL_VIDEODRIVER=null" >> $GITHUB_ENV
