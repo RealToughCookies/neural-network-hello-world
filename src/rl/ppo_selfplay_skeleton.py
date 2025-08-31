@@ -28,6 +28,7 @@ from src.rl.env_api import make_adapter
 from src.rl.checkpoint import save_checkpoint, load_policy_from_ckpt, load_legacy_checkpoint, save_bundle, load_bundle
 from src.rl.ckpt_io import make_bundle, save_checkpoint_v3, load_checkpoint_auto, _capture_rng, _restore_rng
 from src.rl.elo_pool import OpponentPoolV1
+from src.rl.opponent_pool import load_pool, save_pool, register_snapshot
 from src.rl.rollout import collect_rollouts
 import src.rl.adapters  # Import to register adapters
 
@@ -1377,6 +1378,8 @@ def main():
     # v1 Elo Pool arguments
     parser.add_argument("--pool-path", type=str, default="artifacts/rl_opponents.json",
                        help="Path to Elo-based opponent pool JSON file")
+    parser.add_argument("--pool-path-v2", type=str, default=None,
+                       help="Path to v2 opponent pool JSON file (schema 1)")
     parser.add_argument("--opp-sample", choices=["uniform", "topk", "pfsp_elo"], default="pfsp_elo",
                        help="Opponent sampling strategy")
     parser.add_argument("--opp-topk", type=int, default=5,
@@ -1771,6 +1774,18 @@ def main():
                 )
                 pool.save()
                 logger.info("[pool] updated %s with agent=%s", args.pool_path, agent_id)
+            
+            # Add/update agent in v2 opponent pool (schema 1)
+            if args.pool_path_v2:
+                try:
+                    pool_v2 = load_pool(Path(args.pool_path_v2))
+                    ckpt_path = Path(args.save_dir) / "last.pt"
+                    for role in roles_set:
+                        register_snapshot(pool_v2, args.env, role, ckpt_path)
+                    save_pool(Path(args.pool_path_v2), pool_v2)
+                    logger.info("[pool-v2] updated %s with snapshots for roles %s", args.pool_path_v2, roles_set)
+                except Exception as e:
+                    logger.warning("[pool-v2] failed to update: %s", e)
         
         except Exception as e:
             print(f"Collection failed ({e}), skipping update")

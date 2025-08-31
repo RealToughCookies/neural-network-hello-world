@@ -1,0 +1,28 @@
+{
+  "schema": 2,
+  "env": "dota_last_hit",
+  "roles": [
+    "good"
+  ],
+  "agents": [
+    {
+      "policy_id": "rl_ckpts_test_entry:learner",
+      "role": "good",
+      "ckpt": "artifacts/rl_ckpts_test_entry/last.pt",
+      "elo": 1100.0,
+      "games": 0,
+      "wins": 0,
+      "created": "2025-08-29T23:36:56Z"
+    },
+    {
+      "policy_id": "opponent_agent:good",
+      "role": "good",
+      "ckpt": "artifacts/rl_ckpts_dota/last.pt",
+      "elo": 950.0,
+      "games": 0,
+      "wins": 0,
+      "created": "2025-08-29T23:37:09Z"
+    }
+  ],
+  "matches": []
+}
