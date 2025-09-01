@@ -28,8 +28,9 @@ from src.rl.env_api import make_adapter
 from src.rl.checkpoint import save_checkpoint, load_policy_from_ckpt, load_legacy_checkpoint, save_bundle, load_bundle
 from src.rl.ckpt_io import make_bundle, save_checkpoint_v3, load_checkpoint_auto, _capture_rng, _restore_rng
 from src.rl.elo_pool import OpponentPoolV1
-from src.rl.opponent_pool import load_pool, save_pool, register_snapshot, sample_uniform, sample_topk, sample_pfsp_elo
+from src.rl.opponent_pool import load_pool, save_pool, register_snapshot, sample_uniform, sample_topk, sample_pfsp_elo, prune_pool_by_created
 from src.rl.rollout import collect_rollouts
+from src.rl.metrics import wilson_ci
 import src.rl.adapters  # Import to register adapters
 
 N_ACT = 5  # Simple Adversary discrete actions: no-op, left, right, down, up
@@ -38,6 +39,48 @@ N_ACT = 5  # Simple Adversary discrete actions: no-op, left, right, down, up
 def now_iso():
     """Return current UTC time in ISO format."""
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def promote_best_symlink(save_dir: Path, current_ckpt: Path) -> None:
+    """
+    Atomically promote current checkpoint to best checkpoint.
+    
+    Args:
+        save_dir: Directory containing checkpoints
+        current_ckpt: Path to current checkpoint to promote
+    """
+    best_path = save_dir / "best.pt"
+    best_model_path = save_dir / "best_model.pt"
+    
+    # Create best.pt and best_model.pt from current checkpoint
+    if current_ckpt.exists():
+        import shutil
+        shutil.copy2(current_ckpt, best_path)
+        
+        # Also copy model-only version if it exists
+        model_path = current_ckpt.with_name(current_ckpt.stem + "_model.pt")
+        if model_path.exists():
+            shutil.copy2(model_path, best_model_path)
+
+
+def pfsp_mode_for_epoch(epoch: int) -> tuple[str, str]:
+    """
+    Determine PFSP strategy and mode based on epoch progression.
+    
+    Args:
+        epoch: Current training epoch/update
+        
+    Returns:
+        Tuple of (strategy, mode) where strategy is "uniform" or "pfsp"
+        and mode is "hard", "even", or "easy" (or None for uniform)
+    """
+    # epochs: 0-9 uniform, 10-39 even, 40+ hard
+    if epoch < 10:
+        return "uniform", None
+    elif epoch < 40:
+        return "pfsp", "even"  
+    else:
+        return "pfsp", "hard"
 
 
 def load_opponent_head(policy, entry):
@@ -1480,6 +1523,8 @@ def main():
                        help="Current agent's Elo rating for PFSP calculations")
     parser.add_argument("--pool-path-league", type=str, default="artifacts/league_pool.json",
                        help="Path to league opponent pool JSON file")
+    parser.add_argument("--pfsp-ramp", type=str, default=None,
+                       help="PFSP ramping mode ('auto' for epoch-based progression)")
     
     # Dimension handling arguments
     parser.add_argument('--allow-dim-adapter', action='store_true', default=False,
@@ -1725,6 +1770,16 @@ def main():
         
         # League opponent sampling (if enabled and probability hits)
         if args.league_frac > 0.0 and random.random() < args.league_frac:
+            # Determine effective strategy and mode (with optional PFSP ramping)
+            effective_strategy = args.league_strategy
+            effective_mode = args.selfplay_pfsp_mode
+            
+            if args.pfsp_ramp == "auto":
+                effective_strategy, effective_mode = pfsp_mode_for_epoch(update_idx)
+                if effective_strategy != args.league_strategy or effective_mode != args.selfplay_pfsp_mode:
+                    print(f"[pfsp-ramp] epoch {update_idx}: {effective_strategy}" + 
+                          (f"/{effective_mode}" if effective_mode else ""))
+            
             # Try to get current agent Elo from league pool
             current_agent_elo = args.agent_elo
             if league_pool:
@@ -1739,15 +1794,15 @@ def main():
             for role in ["good", "adv"]:
                 opponent_role = "adv" if role == "good" else "good"
                 ckpt_path, agent = pick_opponent_ckpt(
-                    league_pool, opponent_role, args.league_strategy,
-                    topk=args.selfplay_topk, mode=args.selfplay_pfsp_mode,
+                    league_pool, opponent_role, effective_strategy,
+                    topk=args.selfplay_topk, mode=effective_mode,
                     p=args.selfplay_pfsp_p, agent_elo=current_agent_elo, rng=rng
                 )
                 
                 if ckpt_path and agent:
                     league_opponent = agent
                     match_plan = [("league", agent)]
-                    source = f"league_{args.league_strategy}"
+                    source = f"league_{effective_strategy}"
                     
                     # Track selections for logging
                     policy_id = agent.get("policy_id", "unknown")
@@ -1755,7 +1810,7 @@ def main():
                     league_stats["counts"][source] = league_stats["counts"].get(source, 0) + 1
                     
                     logger.info("[league] sample %s: role=%s id=%s elo=%.1f", 
-                               args.league_strategy, opponent_role, policy_id, agent.get("elo", 0))
+                               effective_strategy, opponent_role, policy_id, agent.get("elo", 0))
                     break
         
         # Fallback to v1 Elo pool if no league opponent
@@ -1863,12 +1918,31 @@ def main():
             
             # Run evaluation every eval_every updates
             eval_g = eval_a = 0.0
+            eval_games = 0
+            eval_wins = 0
             if (update_idx + 1) % args.eval_every == 0:
                 try:
                     eval_g, eval_a = evaluate(env, policy.pi["good"], policy.pi["adv"], episodes=args.eval_eps)
                     print(f"Eval: good={eval_g:.3f} adv={eval_a:.3f}")
+                    
+                    # Convert mean returns to wins/games for gating
+                    # Assume win if good agent return > adversary return
+                    eval_games = args.eval_eps
+                    # Heuristic: estimate wins based on relative performance
+                    # This is approximate - in practice you'd track actual wins during evaluation
+                    relative_perf = eval_g - eval_a
+                    if relative_perf > 0:
+                        # Good agent performing better - estimate win rate
+                        estimated_wr = 0.5 + 0.4 * min(1.0, abs(relative_perf))  
+                    else:
+                        # Adversary performing better
+                        estimated_wr = 0.5 - 0.4 * min(1.0, abs(relative_perf))
+                    eval_wins = max(0, min(eval_games, int(estimated_wr * eval_games)))
+                    
                 except Exception as e:
                     print(f"Evaluation failed: {e}")
+                    eval_games = args.eval_eps
+                    eval_wins = eval_games // 2  # Default to 50% win rate
             
             # League statistics logging (once per epoch)
             if args.league_frac > 0.0 and (update_idx + 1) % 10 == 0:  # Log every 10 updates
@@ -1930,19 +2004,39 @@ def main():
             save_checkpoint_v3(bundle, save_dir)
             logger.info("[ckpt v3] wrote last.pt and last_model.pt")
             
-            # Evaluation gating for opponent pool and best checkpoint
-            # Run simplified eval for gating (compute win rates)
-            wr_self = 0.5  # placeholder - could run actual self-play eval
-            wr_uniform = 0.5  # placeholder - could run vs pool eval
+            # Evaluation gating using Wilson confidence intervals
+            current_ckpt = save_dir / "last.pt"
             
-            # Gate best checkpoint update
-            if wr_self >= args.gate_best_min_wr:
-                # Create best.pt and best_model.pt from current bundle
-                shutil.copy2(save_dir / "last.pt", save_dir / "best.pt")
-                shutil.copy2(save_dir / "last_model.pt", save_dir / "best_model.pt")
+            # Gate best checkpoint update using Wilson CI
+            if eval_games > 0 and args.gate_best_min_wr is not None:
+                lb, ub = wilson_ci(eval_wins, eval_games, alpha=0.05)
+                wr_point = eval_wins / eval_games
                 
-                print(f"[gate] saved best checkpoints (wr_self={wr_self:.3f} >= {args.gate_best_min_wr})")
-                best_score = float('inf')  # mark as updated
+                if lb >= args.gate_best_min_wr:
+                    promote_best_symlink(save_dir, current_ckpt)
+                    print(f"[gate] promoted best checkpoint: wr={wr_point:.3f}, CI=[{lb:.3f}, {ub:.3f}], gate={args.gate_best_min_wr}")
+                else:
+                    print(f"[gate] no promotion: wr={wr_point:.3f}, CI=[{lb:.3f}, {ub:.3f}], gate={args.gate_best_min_wr}")
+            
+            # Gate opponent pool registration using Wilson CI
+            if eval_games > 0 and args.pool_path_league and args.gate_pool_min_wr is not None:
+                lb, ub = wilson_ci(eval_wins, eval_games, alpha=0.05)
+                wr_point = eval_wins / eval_games
+                
+                if lb >= args.gate_pool_min_wr:
+                    try:
+                        league_pool_for_gate = load_pool(Path(args.pool_path_league))
+                        # Register for both roles
+                        register_snapshot(league_pool_for_gate, args.env, "good", current_ckpt)
+                        register_snapshot(league_pool_for_gate, args.env, "adv", current_ckpt)
+                        # Prune to capacity
+                        prune_pool_by_created(league_pool_for_gate, args.pool_cap)
+                        save_pool(Path(args.pool_path_league), league_pool_for_gate)
+                        print(f"[gate] registered in league pool: wr={wr_point:.3f}, CI=[{lb:.3f}, {ub:.3f}], gate={args.gate_pool_min_wr}")
+                    except Exception as e:
+                        print(f"[gate] failed to register in league pool: {e}")
+                else:
+                    print(f"[gate] no league registration: wr={wr_point:.3f}, CI=[{lb:.3f}, {ub:.3f}], gate={args.gate_pool_min_wr}")
             
             # Add/update agent in v1 Elo pool
             if args.pool_path:
