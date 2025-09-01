@@ -275,3 +275,22 @@ def record_match(pool: dict, agent_a_id: str, agent_b_id: str, score_a: float, t
         "elo_b_after": new_elo_b
     }
     pool["matches"].append(match_record)
+
+
+def prune_pool_by_created(pool: dict, cap: int) -> None:
+    """
+    Prune pool to keep only the most recent agents by creation time.
+    
+    Args:
+        pool: Pool dictionary to prune
+        cap: Maximum number of agents to keep
+    """
+    agents = pool.get("agents", [])
+    if len(agents) <= cap:
+        return
+    
+    # Sort by created timestamp (oldest first)
+    agents_sorted = sorted(agents, key=lambda x: x.get("created", ""))
+    
+    # Keep only the most recent 'cap' agents
+    pool["agents"] = agents_sorted[-cap:]
