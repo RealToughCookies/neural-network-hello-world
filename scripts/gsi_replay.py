@@ -17,8 +17,8 @@ from typing import Dict, Any, List
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.gsi.schema import (
-    get_health_percent, get_gold, has_boots, has_tp_scroll, 
-    get_ready_abilities, safe_get, get_game_time
+    get_health_percent, has_boots, has_tp_scroll, 
+    any_ability_ready, parse_gsi_payload
 )
 
 
@@ -53,8 +53,7 @@ def check_low_health(data: Dict[str, Any]) -> str:
 
 def check_ready_abilities(data: Dict[str, Any]) -> str:
     """Check if key abilities are ready to use."""
-    ready_abilities = get_ready_abilities(data)
-    if ready_abilities:
+    if any_ability_ready(data):
         return "Key ability up."
     return None
 
@@ -68,7 +67,7 @@ def check_tp_scroll(data: Dict[str, Any]) -> str:
 
 def check_boots_purchase(data: Dict[str, Any]) -> str:
     """Check if player should consider buying boots."""
-    gold = get_gold(data)
+    gold = data.get("player", {}).get("gold")
     has_boots_item = has_boots(data)
     
     if gold is not None and gold >= 500 and not has_boots_item:
@@ -132,7 +131,7 @@ def process_log_file(log_path: Path, rate_limiter: RateLimiter, verbose: bool = 
                     event_count += 1
                     
                     # Get game time for context
-                    game_time = get_game_time(data)
+                    game_time = data.get("map", {}).get("game_time")
                     game_time_str = f"{game_time:.1f}s" if game_time is not None else "??s"
                     
                     # Analyze the game state
@@ -152,15 +151,15 @@ def process_log_file(log_path: Path, rate_limiter: RateLimiter, verbose: bool = 
                     # Show debug info for first few events
                     if verbose and event_count <= 3:
                         health = get_health_percent(data)
-                        gold = get_gold(data)
+                        gold = data.get("player", {}).get("gold")
                         boots = has_boots(data)
                         tp = has_tp_scroll(data)
-                        abilities = get_ready_abilities(data)
+                        abilities_ready = any_ability_ready(data)
                         
                         health_str = f"{health:.2f}" if health is not None else "None"
                         print(f"   Debug: HP={health_str}, "
                               f"Gold={gold}, Boots={boots}, TP={tp}, "
-                              f"Ready abilities={abilities}")
+                              f"Any abilities ready={abilities_ready}")
                 
                 except json.JSONDecodeError as e:
                     print(f"⚠️  Line {line_num}: Invalid JSON - {e}")

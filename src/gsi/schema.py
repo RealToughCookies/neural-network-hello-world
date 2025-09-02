@@ -81,3 +81,69 @@ def parse_gsi_payload(payload: Dict[str, Any], ts: Optional[float] = None) -> GS
         abilities=abilities,
         items=items,
     )
+
+from typing import Union, Iterable
+
+PayloadLike = Union[dict, GSISnapshot]
+
+def _as_payload(p: PayloadLike) -> dict:
+    if isinstance(p, GSISnapshot):
+        # Build a dict view sufficient for the helpers
+        return {
+            "hero": {
+                "health_percent": p.health_percent,
+                "mana_percent": p.mana_percent,
+                "level": p.level,
+                "id": p.hero_id,
+            },
+            "abilities": p.abilities,
+            "items": {str(i): it for i, it in enumerate(p.items or [])},
+        }
+    return p if isinstance(p, dict) else {}
+
+def get_health_percent(payload: PayloadLike) -> float | None:
+    hero = _as_payload(payload).get("hero") or {}
+    return hero.get("health_percent")
+
+def get_mana_percent(payload: PayloadLike) -> float | None:
+    hero = _as_payload(payload).get("hero") or {}
+    return hero.get("mana_percent")
+
+def any_ability_ready(payload: PayloadLike) -> bool:
+    abilities = _as_payload(payload).get("abilities") or {}
+    if not isinstance(abilities, dict):
+        return False
+    for v in abilities.values():
+        if not isinstance(v, dict):
+            continue
+        lvl = int(v.get("level", 0) or 0)
+        cd  = float(v.get("cooldown", 0) or 0.0)
+        if lvl > 0 and cd <= 0:
+            return True
+    return False
+
+def has_tp_scroll(payload: PayloadLike) -> bool:
+    # TP Scroll or Boots of Travel count as a TP option
+    names = _item_names(payload)
+    return any(n in names for n in (
+        "item_tpscroll", "item_travel_boots", "item_travel_boots_2"
+    ))
+
+def has_boots(payload: PayloadLike) -> bool:
+    names = _item_names(payload)
+    _BOOT_TOKENS = ("boots", "phase_boots", "power_treads", "tranquil_boots",
+                   "arcane_boots", "guardian_greaves")
+    return any(("item_" + tok) in names or tok in names for tok in _BOOT_TOKENS)
+
+def _item_names(payload: PayloadLike) -> set[str]:
+    items_raw = _as_payload(payload).get("items") or {}
+    names: set[str] = set()
+    if isinstance(items_raw, dict):
+        for it in items_raw.values():
+            if isinstance(it, dict) and isinstance(it.get("name"), str):
+                names.add(it["name"])
+    elif isinstance(items_raw, list):
+        for it in items_raw:
+            if isinstance(it, dict) and isinstance(it.get("name"), str):
+                names.add(it["name"])
+    return names
