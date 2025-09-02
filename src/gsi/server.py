@@ -13,22 +13,63 @@ from pathlib import Path
 class GSIHandler(BaseHTTPRequestHandler):
     """HTTP handler for Dota 2 Game State Integration requests."""
     
-    def __init__(self, *args, token=None, outdir=None, **kwargs):
+    def __init__(self, *args, token=None, outdir=None, rotate_min=0, **kwargs):
         self.token = token
         self.outdir = Path(outdir) if outdir else Path("artifacts/gsi")
         self.outdir.mkdir(parents=True, exist_ok=True)
+        self.rotate_min = rotate_min
         
-        # Create session log file
-        timestamp = int(time.time())
-        self.log_file = self.outdir / f"session-{timestamp}.ndjson"
+        # Initialize session log file
+        self._create_new_session()
         
         super().__init__(*args, **kwargs)
+    
+    def _create_new_session(self):
+        """Create a new session log file and write session_start record."""
+        timestamp = int(time.time())
+        self.log_file = self.outdir / f"session-{timestamp}.ndjson"
+        self.session_start = time.time()
+        
+        # Write session start record
+        session_start = {
+            "type": "session_start",
+            "ts": self.session_start,
+            "timestamp": timestamp
+        }
+        
+        with open(self.log_file, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(session_start, separators=(',', ':')) + '\n')
+    
+    def _check_rotation(self):
+        """Check if log file should be rotated based on elapsed time."""
+        if self.rotate_min > 0:
+            elapsed_min = (time.time() - self.session_start) / 60.0
+            if elapsed_min >= self.rotate_min:
+                self._create_new_session()
+    
+    def do_GET(self):
+        """Handle GET requests."""
+        if self.path == "/health":
+            # Health check endpoint
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            health_response = {
+                "status": "ok",
+                "timestamp": time.time()
+            }
+            self.wfile.write(json.dumps(health_response).encode('utf-8'))
+        else:
+            self.send_error(404, "Only GET /health is supported")
     
     def do_POST(self):
         """Handle POST requests with GSI data."""
         if self.path != "/":
             self.send_error(404, "Only POST / is supported")
             return
+        
+        # Check rotation before processing
+        self._check_rotation()
         
         # Check authorization
         if not self._check_auth():
@@ -142,10 +183,10 @@ class GSIHandler(BaseHTTPRequestHandler):
             super().log_message(format, *args)
 
 
-def create_handler(token=None, outdir=None):
-    """Create a handler class with bound token and output directory."""
+def create_handler(token=None, outdir=None, rotate_min=0):
+    """Create a handler class with bound token, output directory, and rotation."""
     class BoundGSIHandler(GSIHandler):
         def __init__(self, *args, **kwargs):
-            super().__init__(*args, token=token, outdir=outdir, **kwargs)
+            super().__init__(*args, token=token, outdir=outdir, rotate_min=rotate_min, **kwargs)
     
     return BoundGSIHandler

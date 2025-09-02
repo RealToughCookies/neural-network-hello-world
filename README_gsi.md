@@ -32,7 +32,12 @@ GSI allows external applications to receive live game data from Dota 2. Our syst
 
 ### File Location
 
-The GSI config file must be placed in your Dota 2 installation:
+The GSI config file must be placed in your Dota 2 installation at:
+```
+.../steamapps/common/dota 2 beta/game/dota/cfg/gamestate_integration/
+```
+
+Create the `gamestate_integration` folder if it doesn't exist. Dota 2 uses the same GSI mechanism as CS:GO ([CS:GO GSI spec](https://developer.valvesoftware.com/wiki/Counter-Strike:_Global_Offensive_Game_State_Integration)).
 
 **Windows:**
 ```
@@ -89,12 +94,14 @@ Create a file named `gamestate_integration_rtcoach.cfg` with the following conte
 
 ## Steam Launch Options
 
-Add the launch option `-gamestateintegration` to Dota 2 in Steam:
+Add the launch option `-gamestateintegration` to Dota 2 in Steam ([GitHub guide](https://github.com/antonpup/Dota2GSI/blob/master/README.md)):
 
 1. Right-click Dota 2 in your Steam library
-2. Select "Properties"
+2. Select "Properties" 
 3. In "Launch Options", add: `-gamestateintegration`
 4. Close the properties window
+
+This enables Dota 2's Game State Integration system, which uses the same mechanism as CS:GO GSI.
 
 ## Testing the Setup
 
