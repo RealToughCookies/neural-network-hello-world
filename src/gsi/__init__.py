@@ -1,4 +1,2 @@
-"""
-Game State Integration (GSI) client for Dota 2.
-Minimal HTTP listener that captures hero state, items, creeps, and game events.
-"""
+from .schema import GSISnapshot, parse_gsi_payload, CreepState
+__all__ = ["GSISnapshot", "parse_gsi_payload", "CreepState"]
