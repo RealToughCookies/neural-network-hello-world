@@ -6,8 +6,10 @@ Analyzes CS@5min, denies@5min, and prompt precision/recall with Wilson 95% CI.
 """
 
 import argparse
+import glob
 import json
 import math
+import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -235,8 +237,9 @@ def main():
     
     parser.add_argument(
         "--log",
+        nargs="+",
         required=True,
-        help="Path to NDJSON log file"
+        help="NDJSON files or globs"
     )
     
     parser.add_argument(
@@ -253,16 +256,30 @@ def main():
     
     args = parser.parse_args()
     
-    log_path = Path(args.log)
-    if not log_path.exists():
-        print(f"❌ Log file not found: {log_path}")
-        return 1
+    # Expand globs + dedupe + sort by filename
+    log_paths: list[str] = []
+    for pat in args.log:
+        expanded = glob.glob(pat)
+        log_paths.extend(expanded if expanded else [pat])  # allow exact file too
+    log_paths = sorted(set(os.path.abspath(p) for p in log_paths))
+    
+    if not log_paths:
+        print("No logs matched.", file=sys.stderr)
+        return 2
+    
+    print(f"📁 Processing {len(log_paths)} log files")
     
     # Create evaluator
     evaluator = CoachEvaluator(args.policy, args.tau)
     
-    # Process log file
-    evaluator.process_ndjson_file(log_path)
+    # Process all log files
+    for log_path in log_paths:
+        path_obj = Path(log_path)
+        if not path_obj.exists():
+            print(f"⚠️  Log file not found: {log_path}")
+            continue
+        
+        evaluator.process_ndjson_file(path_obj)
     
     # Compute metrics
     evaluator.compute_performance_metrics()

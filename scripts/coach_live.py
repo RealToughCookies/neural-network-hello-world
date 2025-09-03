@@ -149,8 +149,10 @@ class LiveCoach:
             if self.prompt_bus.maybe_emit(key, text, evidence, now):
                 print(f"🎯 [{timestamp:.1f}s] {text}")
                 
-                # Speak the prompt
-                if speak(text, voice=self.voice):
+                # Speak the prompt if not muted
+                if self.voice == "none":
+                    print(f"🔇 Muted: {text}")
+                elif speak(text, voice=self.voice if self.voice != "say" else None):
                     print(f"🔊 Spoken: {text}")
                 else:
                     print(f"⚠️  Failed to speak: {text}")
@@ -243,17 +245,27 @@ def main():
     
     parser.add_argument(
         "--voice",
-        help="macOS voice name (e.g., 'Alex', 'Samantha')"
+        default="say",
+        help="say|none|... (macOS voice name or 'say' for default)"
     )
     
     parser.add_argument(
         "--check-interval",
         type=float,
-        default=1.0,
+        default=0.5,
         help="How often to check for file updates (seconds)"
     )
     
+    parser.add_argument(
+        "--mute",
+        action="store_true",
+        help="alias for --voice none"
+    )
+    
     args = parser.parse_args()
+    
+    if args.mute:
+        args.voice = "none"
     
     gsi_dir = Path(args.gsi_dir)
     if not gsi_dir.exists():
