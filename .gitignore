@@ -1,3 +1,9 @@
 .venv/
 __pycache__/
 .DS_Store
+.coverage
+artifacts/**/*.ndjson
+artifacts/coach/**
+.coverage
+artifacts/**/*.ndjson
+artifacts/coach/**
