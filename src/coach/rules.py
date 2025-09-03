@@ -5,6 +5,7 @@ Simple rule-based coaching heuristics for Dota 2.
 import logging
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
+import torch
 from ..gsi.schema import GSISnapshot
 
 logger = logging.getLogger(__name__)
@@ -277,3 +278,137 @@ class ComboCoach:
         suggestions.sort(key=lambda x: x.priority, reverse=True)
         
         return suggestions
+
+
+# New GSISnapshot-based rules for coaching prompts
+
+def should_retreat_low_hp(snap: GSISnapshot, threshold: float = 0.35) -> bool:
+    """Return True if hero should retreat due to low health."""
+    if snap.health_percent is None:
+        return False
+    return snap.health_percent < threshold
+
+
+def should_use_ready_abilities(snap: GSISnapshot) -> bool:
+    """Return True if hero has abilities ready to use."""
+    if not snap.abilities:
+        return False
+    
+    for ability_data in snap.abilities.values():
+        if not isinstance(ability_data, dict):
+            continue
+        level = ability_data.get("level", 0)
+        cooldown = ability_data.get("cooldown", 0)
+        
+        if level > 0 and cooldown <= 0:
+            return True
+    
+    return False
+
+
+def should_buy_tp_scroll(snap: GSISnapshot) -> bool:
+    """Return True if player should buy TP scroll."""
+    if not snap.items:
+        return True
+    
+    tp_items = {"item_tpscroll", "item_travel_boots", "item_travel_boots_2"}
+    
+    for item in snap.items:
+        if isinstance(item, dict):
+            item_name = item.get("name")
+            if item_name in tp_items:
+                return False
+    
+    return True
+
+
+def should_buy_boots(snap: GSISnapshot, min_gold: int = 500) -> bool:
+    """Return True if player should consider buying boots."""
+    # Check if player has enough gold (from player stats, not direct attribute)
+    # GSISnapshot doesn't have gold as direct attribute, need to extract from player data
+    if not hasattr(snap, 'gold') or snap.gpm is None:
+        return False
+    
+    # For now, use GPM as proxy - in practice would need player.gold from GSI data
+    # This is a placeholder until we have proper gold extraction
+    player_gold = getattr(snap, 'gold', 0) if hasattr(snap, 'gold') else 0
+    if player_gold < min_gold:
+        return False
+    
+    # Check if player already has boots
+    if not snap.items:
+        return True
+    
+    boot_tokens = {
+        "item_boots", "item_power_treads", "item_phase_boots", 
+        "item_arcane_boots", "item_tranquil_boots", "item_boots_of_travel",
+        "item_guardian_greaves", "item_boots_of_travel_2"
+    }
+    
+    for item in snap.items:
+        if isinstance(item, dict):
+            item_name = item.get("name")
+            if item_name in boot_tokens:
+                return False
+    
+    return True
+
+
+def should_attempt_last_hit(policy: Optional[torch.nn.Module], snap: GSISnapshot, 
+                          tau: float = 0.7) -> bool:
+    """
+    Return True if policy suggests attempting last-hit based on attack probability threshold.
+    
+    Args:
+        policy: PyTorch model that outputs action probabilities
+        snap: Current game state snapshot
+        tau: Minimum probability threshold for attack action
+        
+    Returns:
+        True if policy's attack probability >= tau and creep window is present
+    """
+    if policy is None:
+        return False
+    
+    # For now, we need the env adapter to provide creep state
+    # This is a placeholder implementation - in practice would need:
+    # 1. Convert GSISnapshot to model input format
+    # 2. Run forward pass to get action probabilities  
+    # 3. Check if attack action probability >= tau
+    # 4. Verify creep timing window from environment adapter
+    
+    # Placeholder: return False until we have proper integration
+    return False
+
+
+def get_coaching_prompts(snap: GSISnapshot, policy: Optional[torch.nn.Module] = None, 
+                        tau: float = 0.7) -> Dict[str, str]:
+    """
+    Generate coaching prompts based on game state.
+    
+    Args:
+        snap: Current game state snapshot
+        policy: Optional policy for last-hit recommendations
+        tau: Attack probability threshold for last-hit suggestions
+        
+    Returns:
+        Dictionary mapping prompt keys to text messages
+    """
+    prompts = {}
+    
+    if should_retreat_low_hp(snap):
+        prompts["retreat"] = "Back, low HP."
+    
+    if should_use_ready_abilities(snap):
+        prompts["abilities"] = "Key ability up."
+    
+    if should_buy_tp_scroll(snap):
+        prompts["tp_scroll"] = "Buy TP."
+    
+    if should_buy_boots(snap):
+        prompts["boots"] = "Consider Boots."
+    
+    if should_attempt_last_hit(policy, snap, tau):
+        prompts["last_hit"] = "Good time to last-hit."
+    
+    return prompts
